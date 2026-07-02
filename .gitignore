@@ -1,0 +1,21 @@
+# Go
+/bin/
+/coverage.out
+/.gocache/
+/.python-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Local configuration and state
+*.local.json
+/data/
