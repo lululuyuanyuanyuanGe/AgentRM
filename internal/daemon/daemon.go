@@ -45,11 +45,21 @@ type Daemon struct {
 	mu      sync.Mutex
 }
 
-func New(jobStore store.JobStore, cgroups cgroup.Client, engine *mlfq.Engine) *Daemon {
-	return &Daemon{
+type Option func(*Daemon)
+
+func WithClock(clock func() time.Time) Option {
+	return func(daemon *Daemon) { daemon.now = clock }
+}
+
+func New(jobStore store.JobStore, cgroups cgroup.Client, engine *mlfq.Engine, options ...Option) *Daemon {
+	daemon := &Daemon{
 		store: jobStore, cgroups: cgroups, engine: engine,
 		now: func() time.Time { return time.Now().UTC() },
 	}
+	for _, option := range options {
+		option(daemon)
+	}
+	return daemon
 }
 
 func (d *Daemon) Config() mlfq.Config { return d.engine.Config() }
