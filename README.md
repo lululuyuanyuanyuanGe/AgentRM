@@ -1,329 +1,360 @@
 # AgentRM
 
-面向长生命周期 Coding Agent 的弹性 Sandbox 资源管理系统。
+面向多 Coding Agent Sandbox 的 MLFQ-inspired、work-conserving CPU Scheduler。
 
-AgentRM 利用 Agent Runtime 在工具执行前能够提前表达资源需求这一特点，在固定集群容量内为多个 Session 动态分配、借用和回收 CPU（Central Processing Unit，中央处理器）与 RAM（Random Access Memory，随机存取存储器），并为长期空闲 Sandbox 提供 Full-state Suspend/Resume 编排边界。
+AgentRM 解决的是一个非常具体的问题：当 Kubernetes（容器编排系统）节点 CPU（Central Processing Unit，中央处理器）满载时，几十毫秒的搜索与格式化、几秒的测试任务，会和持续数十秒甚至数分钟的 Compile / Benchmark 竞争，导致短任务被长任务明显拖慢。
 
-> 项目状态：早期可运行原型。核心请求合并、Session Table、弹性 CPU 调度、保守内存回收、挂起/恢复状态机、HTTP API（Hypertext Transfer Protocol Application Programming Interface）和 Python Runtime 已实现并有自动化测试；Kubernetes（容器编排系统）执行适配器、持久化存储和真实 checkpoint 后端仍在路线图中。
+AgentRM 不预测任务时长，也不要求 Agent 提供“这是轻任务还是重任务”的语义。所有新 Tool Job 一律进入 Q0；Node Daemon 读取 cgroup v2（control groups version 2，控制组第二版）的 `cpu.stat`，根据 Job 实际消耗的 CPU service 执行 Q0 → Q1 → Q2 反馈式降权，再将队列等级映射到 `cpu.weight`。
+
+它只改变 contention 下的相对 CPU share，不修改 hard quota，不写 `cpu.max`，也不重启 Pod。高优先级任务没有运行时，低优先级任务仍然可以使用全部剩余 CPU。
+
+> 项目状态：可运行原型。MLFQ（Multi-Level Feedback Queue，多级反馈队列）状态机、实际 CPU service 计量、Aging、Priority Boost、cgroup v2 文件适配、Node Daemon、HTTP API（Hypertext Transfer Protocol Application Programming Interface）、自动化测试和 Kubernetes DaemonSet 已实现。Kubernetes Agent Sandbox watcher、持久化状态和真实 workload benchmark 仍在路线图中。
 
 ## 目录
 
-- [为什么需要 AgentRM](#为什么需要-agentrm)
-- [目标与边界](#目标与边界)
-- [当前已实现能力](#当前已实现能力)
+- [为什么要做这个项目](#为什么要做这个项目)
+- [一句话设计](#一句话设计)
+- [核心目标](#核心目标)
+- [非目标](#非目标)
 - [系统架构](#系统架构)
-- [核心设计](#核心设计)
+- [MLFQ 如何工作](#mlfq-如何工作)
+- [为什么只使用 cpu.weight](#为什么只使用-cpuweight)
+- [为什么不需要 Agent 语义](#为什么不需要-agent-语义)
 - [快速开始](#快速开始)
-- [完整调用示例](#完整调用示例)
-- [Python Runtime](#python-runtime)
-- [HTTP API](#http-api)
+- [接口示例](#接口示例)
+- [Kubernetes 部署](#kubernetes-部署)
+- [配置](#配置)
 - [项目结构](#项目结构)
 - [测试](#测试)
-- [生产化接入](#生产化接入)
-- [实验与指标](#实验与指标)
-- [安全](#安全)
+- [实验设计](#实验设计)
+- [安全与生产注意事项](#安全与生产注意事项)
+- [当前限制](#当前限制)
 - [路线图](#路线图)
 
-## 为什么需要 AgentRM
+## 为什么要做这个项目
 
-一个 Coding Agent Session 可能持续几十分钟甚至数小时，但每个阶段的资源需求差异很大：
-
-```text
-Session A：正在等待模型响应
-实际 CPU 使用接近 0
-Sandbox 固定占用 4 CPU
-
-Session B：正在执行 C++ 编译
-希望使用 8 CPU
-Sandbox 固定只有 2 CPU
-```
-
-固定分配同时造成两种浪费：A 占着不用，B 需要却拿不到。AgentRM 将一个 Session 的资源拆成：
+假设同一个节点上正在运行三个 Sandbox：
 
 ```text
-Guaranteed Resource（minimum）
-+
-Borrowed Resource（allocated - minimum）
+Sandbox A
+Tool: rg / git diff / formatter
+预计只需要几十到几百毫秒 CPU 时间
+
+Sandbox B
+Tool: unit test
+预计需要几秒 CPU 时间
+
+Sandbox C
+Tool: C++ compile / benchmark
+可能持续几十秒或更久
 ```
 
-当集群有空闲时，活跃 Session 可以临时借入资源；资源紧张时，优先从空闲、等待和后台 Session 收回 borrowed resource，再分配给当前真正需要资源的任务。
+CPU 空闲时，三者可以同时运行，不需要任何控制。问题只在 CPU 满载后出现：如果三个 Sandbox 的相对权重完全相同，长时间运行的 Compile / Benchmark 会持续和短 Tool 平分 CPU，短任务的完成时间明显上升，用户感知到 Agent “卡住了”。
 
-目标是在相同集群容量下：
+我们希望同时满足：
 
-- 支持更多并发 Agent Session；
-- 提高集群 CPU 利用率；
-- 降低每个任务消耗的 CPU-core-seconds；
-- 不显著恶化 P95（95th Percentile，第 95 百分位）资源等待时间与工具启动延迟。
+```text
+短任务优先完成
+长任务持续推进
+空闲 CPU 不浪费
+不需要提前预测任务时长
+不需要重启 Pod
+```
 
-## 目标与边界
+## 一句话设计
 
-AgentRM 聚焦三个问题：
+```text
+所有新 Job 进入 Q0
+        │
+        ▼
+读取 cpu.stat 的实际 usage_usec
+        │
+        ▼
+耗尽当前 service quantum 才逐级降权
+        │
+        ▼
+Q0 / Q1 / Q2 映射到 cpu.weight
+        │
+        ▼
+Linux 只在 contention 下按相对权重分配 CPU
+```
 
-1. **Resource Request**：Agent 下一步需要多少资源？
-2. **Allocation/Reclamation**：资源不足时，从谁那里回收多少？
-3. **Suspend/Resume**：Session 长时间空闲时，如何释放运行 Pod 的资源并恢复？
+## 核心目标
 
-AgentRM 不重新实现：
+### 1. 短任务优先完成
 
-- Sandbox 隔离；
-- Container Runtime；
-- Kubernetes Scheduler；
-- CRIU（Checkpoint/Restore In Userspace，用户空间检查点与恢复）格式；
-- 文件系统快照机制。
+新 Tool Job 不论命令是什么，都先获得 Q0 的高相对权重。真正很短的任务通常会在 Q0 quantum 内完成，不会被长 Compile 拖到同一优先级。
 
-生产目标是接入 Kubernetes SIG（Special Interest Group，特别兴趣小组）Agent Sandbox、Pod in-place resize、Kubelet Checkpoint API 和 CRI（Container Runtime Interface，容器运行时接口）兼容运行时。AgentRM 自身负责控制状态、请求队列、受害者选择、资源操作编排与故障协调。
+### 2. 长任务持续推进
 
-## 当前已实现能力
+长任务耗尽 Q0、Q1 quantum 后进入 Q2，但 Q2 权重始终大于零；它只是 contention 下得到较小 share，不会被暂停。
 
-| 模块 | 状态 | 说明 |
-|---|---|---|
-| Resource Model | 已实现 | CPU 使用 millicore，内存使用字节；minimum/maximum 强校验 |
-| Session Table | 已实现 | 维护 desired、allocated、metrics、state、generation 和 checkpoint reference |
-| Coalescing Queue | 已实现 | 每个 Session 只保留最新 generation；优先级队列惰性丢弃旧节点 |
-| Elastic Scheduler | 已实现 | 空闲分配、borrowed resource、victim 排序、部分回收、资源等待 |
-| Memory Guard | 已实现 | working set、稳定窗口、125% 默认安全余量 |
-| Suspend/Resume | 已实现状态机 | 内存后端提供可测试的模拟 checkpoint；尚未连接真实 CRIU |
-| Go Control Plane | 已实现 | REST（Representational State Transfer，表述性状态转移）风格接口与后台 reconcile loop |
-| Python Runtime | 已实现 | 静态命令识别、并行度提取、历史 P95、语义 hint、无第三方依赖客户端 |
-| Kubernetes Backend | 未实现 | 已通过 `SandboxBackend` 接口隔离，等待集群环境接入 |
-| Persistent Store | 未实现 | 当前 Session 和 Sandbox 状态在进程内存中 |
-| Authentication | 未实现 | 当前接口仅适合本地与受信网络开发环境 |
+### 3. Work-conserving
+
+如果 Q0/Q1 Job 阻塞或不存在，Q2 Job 可以使用全部空闲 CPU。AgentRM 不通过 quota 人为制造空闲。
+
+### 4. 基于行为反馈
+
+队列迁移依据真实 `usage_usec`，而不是命令名、Agent hint、模型分类或预计执行时间。
+
+### 5. 不侵入 Sandbox 生命周期
+
+调整 `cpu.weight` 不需要修改 Pod spec、不触发 resize、不重建容器。
+
+## 非目标
+
+AgentRM 当前不负责：
+
+- 预测 `gcc`、`pytest` 或任意命令的执行时间；
+- 让 Agent 声明 Light / Heavy priority；
+- 分配固定 CPU core 数量；
+- 修改 CPU limit 或 `cpu.max`；
+- 调度内存、存储、网络或图形处理器；
+- Suspend / Resume Sandbox；
+- 替代 Linux 内核调度器；
+- 重新实现 Kubernetes Scheduler。
 
 ## 系统架构
 
 ```text
-                          Coding Agent
-                               │
-                     Tool / Task Decision
-                               │
-                               ▼
-                      Resource Estimator
-                 static + history + optional hint
-                               │
-                               ▼
-                       Resource Request
-                    absolute target + generation
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│                     AgentRM Control Plane                    │
-│                                                              │
-│  HTTP API ──► Coalescing Queue ──► Controller               │
-│                     │                  │                       │
-│                     ▼                  ▼                       │
-│                Session Table ◄── Scheduler                    │
-│                                      │                        │
-│                         free capacity + victim selection      │
-└──────────────────────────────────────┼────────────────────────┘
-                                       │
-                                       ▼
-                             SandboxBackend interface
-                                 │             │
-                           MemoryBackend   Kubernetes adapter
-                           current MVP       planned
+          Kubernetes Agent Sandbox / Tool Runtime
+                            │
+              generic Job start / finish
+              job_id + sandbox_id + cgroup_path
+              no command classification or duration hint
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    AgentRM Node Daemon                      │
+│                                                             │
+│  HTTP API ──► Job Store ──► MLFQ Engine                    │
+│                                │                             │
+│                     Q0 / Q1 / Q2 state                       │
+│                                │                             │
+│  cgroup Client ◄── desired cpu.weight                       │
+│       │                                                      │
+│       └──────────── cpu.stat usage_usec ───────────────►     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+                   Linux cgroup v2 CPU controller
 ```
 
-MVP（Minimum Viable Product，最小可行产品）默认使用 `MemoryBackend`，因此克隆仓库后不需要集群即可完整观察调度行为。
+Node Daemon 以 DaemonSet 方式部署，每个节点独立管理本节点的 Sandbox/Tool cgroup。调度决策不跨节点传播，避免为一次 100 ms 的 Tool Job 引入中心控制面往返。
 
-## 核心设计
+### 组件职责
 
-### 1. 绝对资源目标
+| 组件 | 职责 |
+|---|---|
+| `model.ToolJob` | 保存 Job、Sandbox、cgroup、队列、权重和 service counter |
+| `mlfq.Engine` | quantum 降级、Aging 提升、全局 Priority Boost |
+| `cgroup.FSClient` | 只读 `cpu.stat`、读写 `cpu.weight` |
+| `daemon.Daemon` | 注册、完成、周期采样、状态持久化和权重 reconcile |
+| `store.JobStore` | Job authoritative state；当前为内存实现 |
+| `api.Server` | 通用 Job lifecycle 与诊断接口 |
 
-请求使用：
+## MLFQ 如何工作
 
-```json
-{
-  "desired_resource": {
-    "cpu_milli": 8000,
-    "memory_bytes": 6442450944
-  },
-  "generation": 103
-}
-```
+### 默认队列
 
-而不是：
+| Queue | `cpu.weight` | CPU service quantum | 典型结果 |
+|---|---:|---:|---|
+| Q0 | 10000 | 250 ms | 短 Tool 通常在这里完成 |
+| Q1 | 3000 | 2 s | 测试、中型构建继续运行 |
+| Q2 | 500 | 无上限 | Compile / Benchmark 持续推进 |
+
+权重范围来自 cgroup v2：`1..10000`。这些值不是核数，也不是百分比；它们是同一调度层级下 runnable cgroup 之间的相对 share。
+
+### 新 Job
+
+所有 Job 都执行同一逻辑：
 
 ```text
-+4000 CPU
+register
+  ↓
+read initial cpu.stat usage_usec
+  ↓
+queue = Q0
+service_in_level = 0
+cpu.weight = 10000
 ```
 
-绝对目标天然幂等；网络重试不会重复加资源，乱序完成也能通过 generation 判断是否过期。
+没有命令白名单，没有静态规则，也没有大语言模型调用。
 
-### 2. Request Coalescing
+### 实际 CPU service
 
-同一 Session 快速产生：
+每个 tick 读取：
 
 ```text
-generation 101 → 2000m CPU
-generation 102 → 8000m CPU
-generation 103 → 4000m CPU
+usage_usec 1250000
+user_usec 1000000
+system_usec 250000
 ```
 
-队列只保留 generation 103。实现由两部分组成：
-
-- `pending map`：指向每个 Session 的最新请求；
-- `priority heap`：按交互优先级和等待时间选出下一个请求。
-
-旧 heap node 无需同步删除，出队时发现它已不再是 pending map 中的权威节点，直接丢弃。
-
-### 3. Session Table
-
-Session Table 是控制面的 authoritative state，核心字段包括：
+使用相邻观测的差值：
 
 ```text
-minimum / maximum
-desired / allocated / borrowed
-actual_cpu / memory_working_set
-session_state / task_priority
-generation / applied_generation
-last_active_at / pod_state
-checkpoint_reference
+service_delta = current_usage_usec - previous_usage_usec
+service_in_level += service_delta
 ```
 
-Queue 表示“发生了什么请求”，Session Table 表示“系统现在相信什么”。
+这和 wall-clock time 不同。例如一个 Job 在 Q0 等待输入十秒，但只运行了 5 ms，它只消耗 5 ms quantum，仍然保留 Q0。只有实际持续占用 CPU 的任务才会降级。
 
-### 4. 分配与回收
-
-一次调度按以下顺序执行：
-
-1. 将 desired resource 裁剪到 Session 的 minimum/maximum；
-2. 如果请求是安全缩容，先释放目标自己的资源；
-3. 使用集群 free capacity；
-4. 仍有缺口时构建 victim list；
-5. 依次回收 victim 的 borrowed resource；
-6. 只回收当前目标所需数量，不把 victim 一次降到底；
-7. 若所有 Session 都到 minimum 后仍不够，目标进入 `WAITING_RESOURCE`，带短暂 backoff 重新排队，避免高优先等待请求一直占住队首；
-8. 请求只从 reclaim class 比自身更低的 Session 回收，防止后台或等待 Session 反向抢占交互任务；被回收 Session 保留 desired state，未来有空闲容量时自动尝试恢复。
-
-示例：
+### Quantum Demotion
 
 ```text
-Target A：current 5000m → desired 8000m，缺 3000m
-Victim B：minimum 2000m，current 8000m，可回收 6000m
+Q0 service >= 250 ms
+    → Q1, weight 3000
 
-结果：
-B：8000m → 5000m
-A：5000m → 8000m
+Q1 service >= 2 s
+    → Q2, weight 500
+
+Q2
+    → 不再降级，继续运行
 ```
 
-### 5. Victim Selection
+每次进入新队列后，`service_in_level_usec` 归零。
 
-Reclaim class 数字越小，越优先被回收：
+### Aging
 
-| Class | 状态 | 说明 |
-|---:|---|---|
-| 0 | Long-idle 且可挂起 | 长期不活跃 |
-| 1 | `WAITING_USER` / `WAITING_LLM` / `WAITING_RESOURCE` / `READY` | 没有正在执行的工具 |
-| 2 | `BACKGROUND` | 后台任务 |
-| 3 | 普通 `RUNNING_TOOL` | 正常活跃任务 |
-| 4 | 交互式 `RUNNING_TOOL` | 最后回收 |
-
-同一 class 内：
-
-1. borrowed CPU 越多越先回收；
-2. borrowed CPU 相同则越久未活跃越先回收；
-3. 再用 Session ID（Identifier，标识符）保证结果确定。
-
-### 6. CPU 与内存区别
-
-CPU 不足通常意味着任务变慢；内存过度缩容可能导致 OOM（Out of Memory，内存耗尽）。因此：
-
-- CPU borrowed resource 可以较频繁调整；
-- 内存必须存在 working set 指标；
-- working set 必须稳定达到配置窗口；
-- 缩容后仍需保留默认 `25%` headroom；
-- 没有可靠指标时拒绝缩内存。
-
-内存可回收下界：
+低队列中的 Job 会定期提升：
 
 ```text
-max(minimum_memory, memory_working_set × 1.25)
+Q2 wait >= 15 s → Q1
+Q1 wait >= 5 s  → Q0
 ```
 
-### 7. Suspend/Resume
+Aging 一次只提升一级，使长任务周期性获得更高 share，同时避免直接长期占据 Q0。
 
-当前内存后端实现状态机与资源释放语义：
+### Priority Boost
+
+默认每 30 秒触发一次全局 Boost：
 
 ```text
-WAITING / READY / BACKGROUND
-          │
-          ▼
-      SUSPENDING
-          │
-          ▼
-       SUSPENDED (allocated = 0)
-          │
-          ▼
-        RESUMING
-          │
-          ▼
-          READY (allocated = minimum)
+all RUNNING Q1/Q2 jobs → Q0
 ```
 
-生产 Full-state Suspend 路径应保存：
+这提供了更强的 starvation protection，也能修正长期运行中累积的队列偏差。
 
-- Process tree；
-- memory pages；
-- persistent workspace；
-- image digest 与 runtime version；
-- resource spec 与 generation；
-- filesystem snapshot 与 checkpoint reference。
+### CPU 计数器重置
 
-外部 TCP（Transmission Control Protocol，传输控制协议）连接、数据库连接和设备状态不保证透明恢复，应由 post-resume hook 重建。
+如果 cgroup 重建导致 `usage_usec` 小于上次观测，Daemon 将其识别为 counter reset：
+
+- 本次 service delta 记为零；
+- 更新新的计数基线；
+- 不产生无符号整数下溢；
+- 不因为重建误降级 Job。
+
+## 为什么只使用 cpu.weight
+
+`cpu.weight` 和 hard quota 的语义完全不同。
+
+### `cpu.weight`
+
+- 只在多个 runnable cgroup 竞争 CPU 时影响相对 share；
+- 没有其他 runnable cgroup 时，可以使用空闲 CPU；
+- 修改不需要重启容器；
+- 适合 work-conserving priority。
+
+### `cpu.max`
+
+- 是带 period 的硬上限；
+- 即使节点有空闲 CPU，也可能触发 throttling；
+- 容易造成空闲 CPU 浪费；
+- 不是本项目的执行机制。
+
+AgentRM 的 cgroup Client 接口根本没有写 `cpu.max` 的方法。测试会创建 `cpu.max` 哨兵文件，调整权重后再次读取并确认内容未变化。
+
+### 相对 share 示例
+
+如果 Q0 和 Q2 cgroup 在相同父级下同时 runnable：
+
+```text
+Q0 weight = 10000
+Q2 weight =   500
+
+relative ratio ≈ 20 : 1
+```
+
+这不是严格的延迟或吞吐保证。实际结果还取决于 CPU 数量、任务并行度、父级 cgroup、其他系统进程以及 Linux 调度细节。
+
+### Kubernetes CPU limit 注意事项
+
+AgentRM 自己不写 `cpu.max`，但 Kubernetes 现有 CPU limit 仍可能映射成 hard quota。如果 Sandbox Pod 配置了很紧的 CPU limit，低优先级 Job 即使节点有空闲 CPU，也无法突破该 limit。
+
+要获得完整 work-conserving 行为，应避免为这类 Sandbox 设置过紧的 hard CPU limit，或确保上层 quota 足够宽松。CPU request 可以用于 Kubernetes placement，但 request、weight 和 quota 的具体映射必须结合集群运行时验证。
+
+### cgroup 层级注意事项
+
+`cpu.weight` 在层级结构中生效。要让多个 Sandbox 的权重可比较：
+
+- 应在合适的兄弟 cgroup 层级修改权重；
+- `cgroup_path` 应指向真正代表该 Sandbox/Tool 调度实体的 cgroup；
+- 如果 Tool cgroup 位于不同 Pod 父级下，需要确认 Pod 父级权重不会覆盖预期比例；
+- 最简单的模型是每个 Sandbox 同时只有一个活跃 Tool，并直接调整 Sandbox Pod cgroup。
+
+## 为什么不需要 Agent 语义
+
+旧式方案可能要求 Agent 提交：
+
+```text
+resource_hint = LIGHT
+desired_cpu = 8
+predicted_duration = 30s
+```
+
+本设计全部删除。Daemon 只需要三个通用标识：
+
+```text
+job_id
+sandbox_id
+cgroup_path
+```
+
+Job start/finish 可以来自 Agent Sandbox controller、executor lifecycle hook、sidecar 或后续 cgroup discovery adapter。它们只表示生命周期，不表达任务语义。
+
+因此：
+
+- 错误预测不会让长任务长期占据高优先级；
+- 新工具和未知命令自动获得短任务机会；
+- 系统能适应同一命令在不同仓库中的不同行为；
+- 调度依据可直接从内核观测和复现。
 
 ## 快速开始
 
 ### 环境要求
 
 - Go 1.23 或更高版本；
-- Python 3.9 或更高版本；
+- Linux cgroup v2；
+- 对目标 `cpu.weight` 的写权限；
 - `make`，可选。
 
-### 1. 克隆
+macOS 可以运行全部单元测试和内存 cgroup 集成测试，但不能运行真实 Linux cgroup 调度。
+
+### 克隆
 
 ```bash
 git clone https://github.com/lululuyuanyuanyuanGe/AgentRM.git
 cd AgentRM
 ```
 
-### 2. 运行测试
+### 运行验证
 
 ```bash
 make test
+make vet
+make build
 ```
 
-等价命令：
+### 启动 Node Daemon
+
+Linux 节点：
 
 ```bash
-GOCACHE="$PWD/.gocache" go test -race ./...
-cd runtime/python
-PYTHONPATH=. python3 -m unittest discover -s tests -v
-```
-
-### 3. 启动控制面
-
-```bash
-make run
-```
-
-默认配置：
-
-```text
-listen                :8080
-cluster CPU           16000 millicores
-cluster memory        32768 MiB
-reconcile interval    1s
-backend               in-memory
-```
-
-自定义容量：
-
-```bash
-GOCACHE="$PWD/.gocache" go run ./cmd/agentrm \
-  -listen :9090 \
-  -capacity-cpu-milli 32000 \
-  -capacity-memory-mib 65536 \
-  -reconcile-interval 500ms
+sudo ./bin/agentrm \
+  --listen=:8080 \
+  --cgroup-root=/sys/fs/cgroup \
+  --sample-interval=100ms
 ```
 
 健康检查：
@@ -332,198 +363,142 @@ GOCACHE="$PWD/.gocache" go run ./cmd/agentrm \
 curl http://127.0.0.1:8080/healthz
 ```
 
-## 完整调用示例
-
-### 1. 创建交互 Session
+查看队列配置：
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/sessions \
+curl http://127.0.0.1:8080/v1/config
+```
+
+## 接口示例
+
+完整接口见 [docs/api.md](docs/api.md)。
+
+### 注册 Job
+
+假设相对于 `/sys/fs/cgroup` 的目标路径为 `kubepods.slice/pod-uid/tool-job-a`：
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/jobs \
   -H 'Content-Type: application/json' \
   -d '{
-    "session_id": "session-a",
-    "min_resource": {
-      "cpu_milli": 1000,
-      "memory_bytes": 1073741824
-    },
-    "max_resource": {
-      "cpu_milli": 8000,
-      "memory_bytes": 8589934592
-    },
-    "task_priority": 2
+    "job_id": "job-a",
+    "sandbox_id": "sandbox-a",
+    "cgroup_path": "kubepods.slice/pod-uid/tool-job-a"
   }'
 ```
 
-### 2. 工具执行前申请资源
+Daemon 会读取当前 `usage_usec` 作为基线，并写入 Q0 weight。
+
+### 查询 Job
 
 ```bash
-curl -X PATCH http://127.0.0.1:8080/v1/sessions/session-a/state \
-  -H 'Content-Type: application/json' \
-  -d '{"session_state":"RUNNING_TOOL","task_priority":2}'
-
-curl -X POST http://127.0.0.1:8080/v1/sessions/session-a/resources \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "desired_resource": {
-      "cpu_milli": 8000,
-      "memory_bytes": 4294967296
-    },
-    "generation": 1,
-    "priority": 2
-  }'
+curl http://127.0.0.1:8080/v1/jobs/job-a
 ```
 
-后台 reconcile loop 会处理请求。检查结果：
+### 查看队列分布
 
 ```bash
-curl http://127.0.0.1:8080/v1/sessions/session-a
-curl http://127.0.0.1:8080/v1/cluster
+curl http://127.0.0.1:8080/v1/scheduler
 ```
 
-### 3. 工具结束后归还借用资源
+### 结束 Job
 
 ```bash
-curl -X PATCH http://127.0.0.1:8080/v1/sessions/session-a/state \
-  -H 'Content-Type: application/json' \
-  -d '{"session_state":"WAITING_LLM","task_priority":1}'
-
-curl -X POST http://127.0.0.1:8080/v1/sessions/session-a/resources \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "desired_resource": {
-      "cpu_milli": 1000,
-      "memory_bytes": 1073741824
-    },
-    "generation": 2,
-    "priority": 1
-  }'
-```
-
-### 4. 挂起与恢复
-
-```bash
-curl -X POST http://127.0.0.1:8080/v1/sessions/session-a/suspend \
-  -H 'Content-Type: application/json' \
-  -d '{}'
-
-curl -X POST http://127.0.0.1:8080/v1/sessions/session-a/resume \
+curl -X POST http://127.0.0.1:8080/v1/jobs/job-a/finish \
   -H 'Content-Type: application/json' \
   -d '{}'
 ```
 
-## Python Runtime
+失败任务：
 
-Python 包位于 `runtime/python`，不依赖第三方库。
+```bash
+curl -X POST http://127.0.0.1:8080/v1/jobs/job-a/finish \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"FAILED"}'
+```
 
-### Resource Estimator
+## Kubernetes 部署
 
-估算优先级：
+示例清单位于 [deployments/kubernetes/daemonset.yaml](deployments/kubernetes/daemonset.yaml)。
+
+```bash
+kubectl apply -f deployments/kubernetes/daemonset.yaml
+```
+
+DaemonSet：
+
+- 每个节点运行一个 AgentRM；
+- 将宿主机 `/sys/fs/cgroup` 挂载为 `/host-cgroup`；
+- 以 `--cgroup-root=/host-cgroup` 启动；
+- 默认每 100 ms 采样；
+- 当前示例使用 privileged container 获取 cgroup 写权限。
+
+生产环境必须根据容器运行时、内核与安全策略缩小权限。示例镜像地址为 `ghcr.io/lululuyuanyuanyuanGe/agentrm:latest`，需要先构建并发布对应镜像。
+
+### Kubernetes Agent Sandbox 集成点
+
+当前实现提供通用 lifecycle API。推荐集成路径：
 
 ```text
-命令中的显式并行度
->
-历史 P95 profile
->
-命令 / 工具静态分类
->
-Agent semantic hint
->
-默认 profile
+Tool cgroup created
+        │
+        ▼
+Agent Sandbox controller / executor hook
+        │ POST /v1/jobs
+        ▼
+AgentRM Node Daemon
+        │
+        ▼
+Tool exits
+        │ POST /v1/jobs/{id}/finish
+        ▼
+restore idle weight
 ```
 
-当前可识别：
+未来 discovery adapter 可以监听 Kubernetes Pod 和运行时 cgroup 事件，自动完成注册与结束，无需 Agent 代码参与。
 
-- Light：`rg`、`grep`、`cat`、`git diff`、`git status`；
-- Input/Output bound：`git clone`、`pip install`、`npm install`；
-- CPU heavy：`gcc`、`clang`、`make`、`ninja`、`cmake --build`、`cargo build`；
-- Test：`pytest`、`go test`、`cargo test`、`ctest`；
-- Memory heavy：`ld`、`javac`、`rustc`。
+## 配置
 
-并行参数支持 `-j16`、`-j 16`、`--jobs=16`、`--jobs 16`、`pytest -n 16`。
+| Flag | 默认值 | 说明 |
+|---|---:|---|
+| `--listen` | `:8080` | HTTP 监听地址 |
+| `--cgroup-root` | `/sys/fs/cgroup` | cgroup v2 根目录 |
+| `--sample-interval` | `100ms` | `cpu.stat` 采样周期 |
+| `--q0-weight` | `10000` | Q0 相对权重 |
+| `--q1-weight` | `3000` | Q1 相对权重 |
+| `--q2-weight` | `500` | Q2 相对权重 |
+| `--q0-quantum` | `250ms` | Q0 实际 CPU service quantum |
+| `--q1-quantum` | `2s` | Q1 实际 CPU service quantum |
+| `--q1-aging` | `5s` | Q1 Aging 阈值 |
+| `--q2-aging` | `15s` | Q2 Aging 阈值 |
+| `--boost-interval` | `30s` | 全局 Priority Boost 周期 |
+| `--idle-weight` | `100` | Job 完成后的恢复权重 |
 
-示例：
+配置校验：
 
-```python
-from agentrm_runtime import ResourceBounds, ResourceEstimator
-
-estimator = ResourceEstimator()
-estimate = estimator.estimate(
-    "cmake --build . -j16",
-    bounds=ResourceBounds(
-        min_cpu_milli=500,
-        max_cpu_milli=32000,
-        min_memory_bytes=512 * 1024 * 1024,
-        max_memory_bytes=32 * 1024 * 1024 * 1024,
-    ),
-)
-
-print(estimate)
+```text
+1 <= weight <= 10000
+Q0 weight > Q1 weight > Q2 weight
+Q0 / Q1 quantum > 0
+Aging / Boost interval > 0
+sample interval > 0
 ```
 
-### Runtime Client
-
-```python
-from agentrm_runtime import AgentRMClient, ResourceEstimator
-
-client = AgentRMClient("http://127.0.0.1:8080")
-estimator = ResourceEstimator()
-
-client.create_session(
-    session_id="agent-42",
-    min_cpu_milli=1000,
-    min_memory_bytes=1024**3,
-    max_cpu_milli=8000,
-    max_memory_bytes=8 * 1024**3,
-    priority=2,
-)
-
-estimate = estimator.estimate("pytest -n 8")
-client.update_state("agent-42", "RUNNING_TOOL", priority=2)
-client.request_resources("agent-42", estimate, generation=1, priority=2)
-```
-
-运行仓库示例：
-
-```bash
-cd runtime/python
-PYTHONPATH=. python3 ../../examples/runtime_demo.py
-```
-
-## HTTP API
-
-完整字段和错误码见 [docs/api.md](docs/api.md)。
-
-| Method | Path | 用途 |
-|---|---|---|
-| `GET` | `/healthz` | 健康检查 |
-| `GET` | `/v1/cluster` | 集群容量快照 |
-| `POST` | `/v1/sessions` | 创建 Session |
-| `GET` | `/v1/sessions` | 列出 Session |
-| `GET` | `/v1/sessions/{id}` | 获取 Session |
-| `PATCH` | `/v1/sessions/{id}/state` | 更新 Agent 语义状态 |
-| `PUT` | `/v1/sessions/{id}/metrics` | 更新资源指标 |
-| `POST` | `/v1/sessions/{id}/resources` | 提交绝对资源目标 |
-| `POST` | `/v1/sessions/{id}/suspend` | 挂起 Sandbox |
-| `POST` | `/v1/sessions/{id}/resume` | 恢复 Sandbox |
-| `POST` | `/v1/sessions/{id}/finish` | 结束 Session |
-| `POST` | `/v1/scheduler/run-once` | 手动执行一个调度周期 |
+默认参数是原型初始值，需要通过真实 Coding Agent trace 调优，不能直接视为所有集群的最优配置。
 
 ## 项目结构
 
 ```text
 AgentRM/
-├── cmd/agentrm/                 # Go 控制面入口
+├── cmd/agentrm/                 # Node Daemon 入口与 flags
 ├── internal/
-│   ├── api/                     # HTTP handlers
-│   ├── backend/                 # SandboxBackend 与 MemoryBackend
-│   ├── controller/              # 状态变更与资源操作编排
-│   ├── model/                   # Session、Request、Resource 模型
-│   ├── queue/                   # 合并式优先级队列
-│   ├── scheduler/               # 分配、victim selection、内存保护
-│   └── store/                   # SessionStore 与内存实现
-├── runtime/python/
-│   ├── agentrm_runtime/         # estimator 与客户端
-│   └── tests/
-├── examples/                    # Runtime 调用示例
+│   ├── api/                     # Job lifecycle 与诊断接口
+│   ├── cgroup/                  # cpu.stat / cpu.weight 客户端
+│   ├── daemon/                  # 注册、完成与周期 reconcile
+│   ├── mlfq/                    # quantum、Aging、Priority Boost
+│   ├── model/                   # ToolJob 与 Q0/Q1/Q2 状态
+│   └── store/                   # JobStore 与内存实现
+├── deployments/kubernetes/      # DaemonSet 示例
 ├── docs/
 │   ├── api.md
 │   └── architecture.md
@@ -532,196 +507,193 @@ AgentRM/
 └── README.md
 ```
 
-更详细的一致性、不变量与故障语义见 [docs/architecture.md](docs/architecture.md)。
+详细算法、不变量与 cgroup 层级说明见 [docs/architecture.md](docs/architecture.md)。
 
 ## 测试
 
-Go 测试覆盖：
-
-- 同一 Session 的请求合并与 stale generation；
-- 交互优先级和等待时间排序；
-- free capacity 分配；
-- victim class 选择；
-- 只回收实际缺口；
-- 所有 Session 到 minimum 后进入等待；
-- 内存稳定窗口与 headroom；
-- Controller 资源申请、回收、挂起和恢复；
-- HTTP Session 生命周期。
-
-Python 测试覆盖：
-
-- 轻量命令分类；
-- 显式并行度优先；
-- 历史 P95 覆盖静态 profile；
-- semantic hint fallback；
-- minimum/maximum clamp。
-
-运行带 race detector 的全部测试：
+运行全部测试：
 
 ```bash
 make test
 ```
 
-## 生产化接入
+测试启用 Go race detector，覆盖：
 
-### 1. Kubernetes Backend
+### MLFQ Engine
 
-实现 `internal/backend.SandboxBackend`：
+- 新 Job 固定进入 Q0；
+- 使用 CPU service 而不是 wall time；
+- Q0 quantum exhaustion 进入 Q1；
+- Q1 quantum exhaustion 进入 Q2；
+- Q2 不继续降级；
+- Q1 / Q2 Aging；
+- global Priority Boost；
+- `usage_usec` counter reset。
 
-```go
-type SandboxBackend interface {
-    Resize(context.Context, ResizeOperation) error
-    Suspend(context.Context, string, int64) (string, error)
-    Resume(context.Context, string, string, model.Resources, int64) error
-    Delete(context.Context, string) error
-}
+### cgroup Client
+
+- 完整解析 `cpu.stat`；
+- 缺少 `usage_usec` 时失败；
+- 读写 `cpu.weight`；
+- 权重范围校验；
+- 拒绝绝对路径与 `..` escape；
+- 验证修改权重后 `cpu.max` 完全不变。
+
+### Node Daemon
+
+- 注册 Job 时设置 Q0 weight；
+- 重试注册幂等；
+- 一个 cgroup 只能有一个运行 Job；
+- 长 Job 逐级降到 Q2；
+- 新短 Job 保持 Q0；
+- Q0 / Q2 权重同时存在；
+- Job 完成后恢复 idle weight。
+
+### HTTP API
+
+- Job 注册、采样、降级、查询与结束；
+- 配置和队列快照；
+- JSON 请求约束与错误映射。
+
+静态检查与构建：
+
+```bash
+make vet
+make build
 ```
 
-推荐职责：
+## 实验设计
 
-- `Resize`：写入 Pod resize subresource，并关联 request generation；
-- `Suspend`：阻止新工具、冻结 guest、触发 Kubelet checkpoint、持久化 workspace 与元数据、删除 Pod；
-- `Resume`：兼容性检查、分配节点、恢复 workspace、恢复进程和内存、运行 post-resume hook；
-- `Delete`：结束 Sandbox 并清理受控资源。
+这个项目最终必须证明的不是“队列能迁移”，而是短任务尾延迟真的下降，并且 CPU 不被浪费。
 
-### 2. Persistent Session Store
-
-当前 `MemorySessionStore` 应替换为 PostgreSQL（对象关系数据库）或其他持久化存储。Controller 启动时需要执行：
+### Baseline A：Equal Weight
 
 ```text
-desired state from Session Store
-vs
-actual state from Kubernetes watch/list
-→ reconciliation
+所有 Sandbox cpu.weight 相同
 ```
 
-Event queue 不能成为唯一状态源。
-
-### 3. Event 与 Metrics
-
-状态变化适合 watch/event：
-
-- Pod Ready / Failed / Deleted；
-- resize started / completed / failed；
-- checkpoint completed / failed；
-- suspend / resume completed；
-- Agent state event。
-
-连续资源使用适合轻量周期采样：
-
-- cgroup v2（control groups version 2，控制组第二版）；
-- metrics-server；
-- Prometheus。
-
-### 4. 可观测性
-
-生产版计划输出：
-
-- resource request wait duration；
-- resize latency 与 failure count；
-- reclaimed/borrowed CPU；
-- memory shrink rejected reason；
-- checkpoint latency、size 与 released memory；
-- Session state transition；
-- OpenTelemetry（开放遥测）trace。
-
-## 实验与指标
-
-建议对比三组：
-
-1. **Fixed Allocation**：每个 Sandbox 固定资源；
-2. **Request Only**：有空闲就扩，没有就等待，不回收；
-3. **AgentRM**：请求合并、弹性借用、优先级回收、Suspend。
-
-Workload 应混合：
-
-- Light tool：`grep`、`git`、`cat`；
-- CPU heavy：`gcc`、`cmake`、`ninja`；
-- Input/Output heavy：`git clone`、包安装；
-- Test：`pytest`；
-- Long idle：`WAITING_USER`；
-- Interactive、background 和 long-running Agent。
-
-四个核心指标：
+### Baseline B：Hard Quota Priority
 
 ```text
-Concurrent Agent Sessions              ↑
-Cluster CPU Utilization                 ↑
-CPU-core-seconds / Task                 ↓
-P95 Resource Wait / Tool Start Delay    不明显恶化
+低优先级任务设置较低 cpu.max
 ```
 
-Suspend 单独记录：
+它可能改善短任务，但会在高优先级空闲时浪费 CPU。
 
-- checkpoint latency；
-- resume latency；
-- checkpoint size；
-- released RAM。
+### AgentRM
 
-## 安全
+```text
+Q0 / Q1 / Q2 feedback
++
+cpu.weight only
++
+Aging / Priority Boost
+```
 
-真实 checkpoint archive 可能包含进程内存中的 token、password、API key 和其他敏感数据，生产实现必须至少具备：
+### Workload
 
-- encryption at rest；
-- 按 Session 隔离的访问控制；
-- 仅限 controller service account 的最小权限；
-- checkpoint TTL（Time To Live，生存时间）清理；
-- 审计日志；
-- 恢复前完整性和兼容性校验；
-- HTTP API 鉴权、授权与传输加密。
+在 CPU 满载节点混合：
 
-当前内存版本未实现鉴权，不应直接暴露到公网。
+- 50–300 ms 搜索、格式化和小 Tool；
+- 1–10 s 单元测试；
+- 30–180 s Compile；
+- 5 min Benchmark；
+- 不同到达率与并发 Sandbox 数量。
+
+### 核心指标
+
+```text
+P50 / P95 / P99 short-job completion time     ↓
+test completion time                          ↓ or stable
+long-job throughput                           remains acceptable
+node CPU utilization                          stays near saturated
+idle CPU caused by policy                     ≈ 0
+queue promotions / demotions                  explainable
+```
+
+### 公平性指标
+
+- Q2 Job 在持续短任务到达时仍获得 CPU service；
+- 最大 starvation interval；
+- Priority Boost 前后的 service share；
+- 不同权重和 quantum 对长任务 slowdown 的影响。
+
+## 安全与生产注意事项
+
+Node Daemon 能修改宿主机 cgroup controller 文件，是高权限组件。
+
+生产要求：
+
+- lifecycle API 只允许节点内受信组件访问；
+- 增加节点身份认证与授权；
+- 严格校验 `cgroup_path`；
+- 限制允许管理的 Pod、namespace 和 cgroup subtree；
+- 根据环境替换 privileged container 为最小权限；
+- 记录 queue transition 与 weight write 审计日志；
+- 对频繁失败的 cgroup 做退避与告警；
+- 不接受任意主机文件路径；
+- 不把 HTTP 端口直接暴露公网。
+
+当前路径校验拒绝绝对路径、`.` 和 `..` escape；真实 cgroup root 也必须在启动时存在且为目录。
+
+## 当前限制
+
+- `MemoryJobStore` 在 Daemon 重启后丢失；
+- Kubernetes Agent Sandbox watcher 尚未实现；
+- 当前通过 lifecycle API 注册 Job cgroup；
+- 尚未自动发现已存在的运行中 Job；
+- 尚未提供 Prometheus 指标和 OpenTelemetry（开放遥测）trace；
+- 尚未用真实多 Sandbox trace 校准默认参数；
+- 权重效果受 cgroup hierarchy 和现有 Kubernetes CPU limit 影响；
+- 同一个被调度实体必须有可独立写权重的 cgroup。
 
 ## 路线图
 
-### Phase 1 — Basic Runtime
+### Phase 1 — MLFQ Core
 
-- [x] Session model 与内存 Session Store
-- [x] Sandbox backend interface
-- [x] 本地可运行 MemoryBackend
-- [x] HTTP control plane
+- [x] Tool Job model
+- [x] Q0 / Q1 / Q2
+- [x] CPU service quantum
+- [x] Demotion
+- [x] Aging
+- [x] Global Priority Boost
+- [x] Counter reset handling
 
-### Phase 2 — Resource Request
+### Phase 2 — Node Daemon
 
-- [x] 静态 Resource Estimator
-- [x] 显式并行度解析
-- [x] Historical P95 profile
-- [x] Request coalescing
-- [x] Generation 幂等语义
+- [x] `cpu.stat` reader
+- [x] `cpu.weight` reconciler
+- [x] Generic Job lifecycle API
+- [x] Per-job failure isolation
+- [x] Kubernetes DaemonSet example
+- [ ] Persistent local Job Store
+- [ ] Restart reconciliation
 
-### Phase 3 — Elastic CPU Scheduler
+### Phase 3 — Agent Sandbox Integration
 
-- [x] Minimum/maximum resource
-- [x] Borrowed resource
-- [x] Free capacity allocation
-- [x] Victim selection
-- [x] Priority reclamation
-- [ ] Kubernetes in-place resize adapter
+- [ ] Kubernetes Agent Sandbox watcher
+- [ ] Tool cgroup discovery adapter
+- [ ] Pod / Sandbox identity resolver
+- [ ] Automatic stale Job cleanup
+- [ ] Multi-container Sandbox handling
 
-### Phase 4 — Memory Control
+### Phase 4 — Observability
 
-- [x] Memory working set model
-- [x] Stable window 与 headroom
-- [ ] OOM event feedback
-- [ ] 多采样窗口与自适应 headroom
+- [ ] Queue size and transition metrics
+- [ ] Per-queue CPU service
+- [ ] Short-job latency histogram
+- [ ] Weight write failure metrics
+- [ ] Node contention and utilization metrics
 
-### Phase 5 — Deep Suspend
+### Phase 5 — Evaluation
 
-- [x] Suspend/Resume 控制状态机
-- [x] Checkpoint backend contract
-- [ ] Kubelet Checkpoint API adapter
-- [ ] CRIU-compatible restore
-- [ ] Persistent workspace snapshot
-- [ ] Post-resume hook
-
-### Phase 6 — Recovery and Production
-
-- [ ] PostgreSQL / Redis state adapter
-- [ ] Kubernetes watch/informer
-- [ ] Controller restart reconciliation
-- [ ] Metrics、trace 与 benchmark suite
-- [ ] Authentication、authorization 与 multi-tenancy
+- [ ] Reproducible mixed workload generator
+- [ ] Equal-weight baseline
+- [ ] Hard-quota baseline
+- [ ] P95 / P99 short-job latency report
+- [ ] Long-job slowdown and starvation analysis
+- [ ] Weight / quantum tuning guide
 
 ---
 
-AgentRM 的核心判断很简单：**暂时不用的资源应该让给现在真正需要资源的 Agent；长期不用的 Sandbox 应该被完整挂起，而不是继续占用计算容量。**
+AgentRM 的核心原则是：**不猜任务会运行多久，只观察它已经消耗了多少 CPU；不限制低优先级任务能跑多少，只在真正竞争时改变谁先获得更多 CPU。**
