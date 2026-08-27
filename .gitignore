@@ -2,6 +2,7 @@
 /bin/
 /coverage.out
 /.gocache/
+/.gomodcache/
 /.python-cache/
 
 # Python

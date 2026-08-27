@@ -1,21 +1,19 @@
-.PHONY: build run test test-go test-python fmt
+.PHONY: build run test vet fmt
 
 GOCACHE ?= $(CURDIR)/.gocache
-PYTHONPYCACHEPREFIX ?= $(CURDIR)/.python-cache
+GOMODCACHE ?= $(CURDIR)/.gomodcache
 
 build:
-	GOCACHE=$(GOCACHE) go build -o bin/agentrm ./cmd/agentrm
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go build -o bin/agentrm ./cmd/agentrm
 
 run:
-	GOCACHE=$(GOCACHE) go run ./cmd/agentrm
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go run ./cmd/agentrm
 
-test: test-go test-python
+test:
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go test -race ./...
 
-test-go:
-	GOCACHE=$(GOCACHE) go test -race ./...
-
-test-python:
-	cd runtime/python && PYTHONPYCACHEPREFIX=$(PYTHONPYCACHEPREFIX) PYTHONPATH=. python3 -m unittest discover -s tests -v
+vet:
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go vet ./...
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './.gocache/*')

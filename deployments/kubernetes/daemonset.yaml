@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agentrm
+  namespace: agent-sandbox-system
+  labels:
+    app.kubernetes.io/name: agentrm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentrm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentrm
+    spec:
+      containers:
+        - name: agentrm
+          image: ghcr.io/lululuyuanyuanyuanGe/agentrm:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=:8080
+            - --cgroup-root=/host-cgroup
+            - --sample-interval=100ms
+            - --q0-weight=10000
+            - --q1-weight=3000
+            - --q2-weight=500
+            - --q0-quantum=250ms
+            - --q1-quantum=2s
+            - --q1-aging=5s
+            - --q2-aging=15s
+            - --boost-interval=30s
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: cgroup
+              mountPath: /host-cgroup
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory

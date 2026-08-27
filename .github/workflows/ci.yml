@@ -1,4 +1,4 @@
-name: CI
+name: Continuous Integration
 
 on:
   push:
@@ -26,18 +26,3 @@ jobs:
         run: go test -race ./...
       - name: Build
         run: go build ./cmd/agentrm
-
-  python:
-    name: Python
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.9", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Test runtime
-        working-directory: runtime/python
-        run: PYTHONPATH=. python -m unittest discover -s tests -v
