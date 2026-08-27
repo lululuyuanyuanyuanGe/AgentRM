@@ -24,6 +24,13 @@ func NewFSClient(root string) (*FSClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("stat cgroup root: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, errors.New("cgroup root must be a directory")
+	}
 	return &FSClient{root: filepath.Clean(abs)}, nil
 }
 

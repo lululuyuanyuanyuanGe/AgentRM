@@ -80,6 +80,18 @@ func TestFSClientRejectsEscapingPaths(t *testing.T) {
 	}
 }
 
+func TestFSClientRequiresExistingDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if _, err := NewFSClient(missing); err == nil {
+		t.Fatal("expected missing cgroup root to fail")
+	}
+	file := filepath.Join(t.TempDir(), "not-a-directory")
+	writeTestFile(t, file, "x")
+	if _, err := NewFSClient(file); err == nil {
+		t.Fatal("expected non-directory cgroup root to fail")
+	}
+}
+
 func writeTestFile(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {

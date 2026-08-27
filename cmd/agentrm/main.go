@@ -33,6 +33,10 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if *sampleInterval <= 0 {
+		logger.Error("sample interval must be positive")
+		os.Exit(2)
+	}
 	config := mlfq.Config{
 		Q0:      mlfq.LevelConfig{Weight: *q0Weight, Quantum: *q0Quantum},
 		Q1:      mlfq.LevelConfig{Weight: *q1Weight, Quantum: *q1Quantum},
