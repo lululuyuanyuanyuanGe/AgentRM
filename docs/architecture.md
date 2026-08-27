@@ -1,147 +1,184 @@
-# AgentRM 架构与一致性设计
+# AgentRM MLFQ CPU Scheduler 架构
 
-## 1. 控制面边界
+## 1. 问题定义
 
-AgentRM 只负责资源意图、调度决策和 Sandbox 操作编排，不重新实现容器运行时、操作系统隔离或 checkpoint 格式。
+一个 Kubernetes（容器编排系统）节点上可能同时运行多个 Coding Agent Sandbox：
 
-```text
-Agent Runtime
-  ├─ Session event
-  ├─ Resource request
-  └─ Metrics sample
-          │
-          ▼
-HTTP API → Controller → Coalescing Queue
-                        │
-                        ▼
-                 Session Store
-                        │
-                        ▼
-                   Scheduler
-                    │       │
-                    │       └─ Victim selection
-                    ▼
-               Sandbox Backend
-```
+- 几十毫秒到几百毫秒的搜索、格式化和轻量 Tool；
+- 数秒的单元测试；
+- 数十秒到数分钟的 Compile；
+- 更长时间的 Benchmark。
 
-`internal/backend.SandboxBackend` 是唯一执行层边界。当前 `MemoryBackend` 用于本地开发和确定性测试；Kubernetes（容器编排系统）适配器需要实现 resize、suspend、resume 和 delete 四个操作。
+CPU（Central Processing Unit，中央处理器）不满载时，这些任务可以同时使用空闲核心；CPU 满载时，如果所有 Sandbox 具有相同调度权重，长 Compile 或 Benchmark 会显著增加短 Tool 的完成时间。
 
-## 2. 关键不变量
-
-### 2.1 资源边界
-
-对任何非挂起 Session：
+AgentRM 的目标不是限制长任务，而是在 contention 下让短任务优先完成，同时保证长任务持续推进：
 
 ```text
-minimum <= desired <= maximum
-minimum <= allocated <= maximum
+No contention:
+Linux uses every idle CPU cycle
+
+Contention:
+Q0 gets a larger relative share than Q1
+Q1 gets a larger relative share than Q2
 ```
 
-挂起或结束时 `allocated = 0`。
+## 2. 非目标
 
-### 2.2 集群容量
+AgentRM 不做：
 
-每个调度计划都保持：
+- 根据命令、模型或 Agent hint 预测任务时长；
+- 修改 hard CPU quota；
+- 为每个 Sandbox 预留固定 CPU；
+- 重启 Pod 来改变资源；
+- 替代 Linux Completely Fair Scheduler（完全公平调度器）；
+- 调度内存、存储或图形处理器。
+
+## 3. 总体架构
 
 ```text
-sum(allocated) <= cluster capacity
+Kubernetes Agent Sandbox / Tool Runtime
+                │
+       generic job start/finish
+       (no semantic classification)
+                │
+                ▼
+┌──────────────────────────────────────────────────────┐
+│                 AgentRM Node Daemon                  │
+│                                                      │
+│  Job Store ──► MLFQ Engine ──► Q0 / Q1 / Q2        │
+│      ▲                ▲                 │             │
+│      │                │                 ▼             │
+│ lifecycle       cpu.stat usage     desired weight     │
+│      │                │                 │             │
+│      └──────── cgroup v2 Client ◄───────┘             │
+└──────────────────────────────────────────────────────┘
+                         │
+                         ▼
+                 Linux cpu.weight
 ```
 
-Controller 用互斥区串行执行会改变总资源的操作，避免并发计划基于同一份旧快照而过量分配。
+Node Daemon 以 Kubernetes DaemonSet 运行，每个节点独立调度本节点的 Tool Job。当前接口通过通用 Job lifecycle 注册 cgroup；后续可由 Agent Sandbox controller、executor hook 或 cgroup discovery adapter 自动产生这些事件。该事件只表达“Job 开始/结束和对应 cgroup”，不包含任务语义或预计时长。
 
-### 2.3 请求幂等
+## 4. MLFQ 状态
 
-请求表达绝对目标：
+MLFQ（Multi-Level Feedback Queue，多级反馈队列）默认参数：
+
+| Queue | `cpu.weight` | Service quantum | 定位 |
+|---|---:|---:|---|
+| Q0 | 10000 | 250 ms | 所有新 Job、短 Tool |
+| Q1 | 3000 | 2 s | 中等长度测试或构建 |
+| Q2 | 500 | 无上限 | 长 Compile、Benchmark |
+
+所有新 Job 无条件进入 Q0。系统不提前判断它是 grep、test 还是 compile。
+
+状态迁移：
 
 ```text
-desired_cpu = 8000 millicores
+new job
+   │
+   ▼
+  Q0 ── consume Q0 quantum ──► Q1 ── consume Q1 quantum ──► Q2
+   ▲                            ▲                            │
+   │                            └──────── Aging ─────────────┘
+   └──────────── Aging / global Priority Boost ─────────────┘
 ```
 
-而不是 `cpu += 4000`。同一 Session 只有最新 generation 保留在 pending map 中；堆里的旧节点在出队时惰性丢弃。
+每次迁移都会重置当前 queue 的 service counter，并立即映射新的 `cpu.weight`。
 
-### 2.4 Stale completion
+## 5. 使用实际 CPU Service
 
-Session 同时保存：
-
-- `generation`：控制面当前希望达到的版本。
-- `applied_generation`：最近成功执行的目标版本。
-
-后续接入异步 Kubernetes resize completion event 时，只能在 event generation 不小于当前 generation 时更新 applied state。
-
-## 3. 调度算法
-
-对目标 Session 的一次请求：
-
-1. 将目标裁剪到 Session 的 minimum 和 maximum。
-2. 对 CPU（Central Processing Unit，中央处理器）安全缩容；内存缩容需要先通过稳定性检查。
-3. 使用集群当前空闲容量。
-4. 若仍有缺口，构建 victim list。
-5. 依次回收 borrowed resource，且只回收本次缺口所需数量。
-6. 若所有 Session 均到 minimum 后仍不足，目标进入 `WAITING_RESOURCE`，请求带短暂 backoff 重新入队，避免无法满足的高优先请求阻塞后续释放请求。
-
-Victim 排序键：
+Daemon 周期读取 cgroup v2 `cpu.stat`：
 
 ```text
-(reclaim_class ASC, borrowed_cpu DESC, last_active_at ASC, session_id ASC)
+usage_usec 1234567
+user_usec 1000000
+system_usec 234567
 ```
 
-请求只会从 reclaim class 比自身更低的 Session 回收资源，避免等待或后台 Session 为恢复旧的 desired allocation 反向抢占正在运行的交互任务。被回收 Session 会保留 desired state，并在未来出现 free capacity 后自动尝试恢复 borrowed resource。
-
-Reclaim class：
-
-| Class | Session 类型 | 含义 |
-|---:|---|---|
-| 0 | 长时间空闲且可挂起 | 最优先回收 |
-| 1 | 等待用户、等待模型、等待资源、Ready | 无工具正在执行 |
-| 2 | Background | 后台任务 |
-| 3 | 普通 Active | 普通活跃任务 |
-| 4 | Interactive Active | 最后回收 |
-
-## 4. 内存保护
-
-CPU 分配不足通常只会降低速度，内存压缩过度可能触发 OOM（Out of Memory，内存耗尽）。因此内存可回收下界为：
+对同一 Job 连续两次观测：
 
 ```text
-max(session.minimum_memory, working_set × headroom)
+service_delta = current_usage_usec - previous_usage_usec
 ```
 
-默认 headroom 为 `125%`，working set 必须稳定至少两分钟。缺少指标或稳定时间不足时，不允许内存缩容。
+只有实际获得的 CPU 时间计入 quantum。一个 Q0 Job 即使等待输入十秒，只要只消耗 10 ms CPU，就仍然留在 Q0；一个持续占用 CPU 的 Job 才会快速降到 Q1、Q2。这避免了 wall-clock quantum 对阻塞型任务的误判。
 
-## 5. Suspend/Resume 状态机
+若 cgroup 重建导致计数器变小，Daemon 将其视为 counter reset：更新基线但不制造虚假的巨大 service delta。
 
-```text
-READY / WAITING / BACKGROUND
-            │ suspend
-            ▼
-       SUSPENDING
-            │ checkpoint persisted
-            ▼
-        SUSPENDED
-            │ resume + minimum allocation
-            ▼
-         RESUMING
-            │ backend ready
-            ▼
-           READY
-```
+## 6. Aging 与 Priority Boost
 
-生产级 Full-state Suspend 后端应依次执行：阻止新工具、冻结进程、刷写文件系统、创建进程与内存 checkpoint、持久化元数据、删除 Pod。恢复后必须通过 hook 重建外部连接；TCP（Transmission Control Protocol，传输控制协议）连接、数据库连接和设备状态不属于透明恢复保证。
+长任务不能永久停留在最低相对权重：
 
-## 6. 故障语义
+- Q1 停留达到 `q1-aging`，提升到 Q0；
+- Q2 停留达到 `q2-aging`，提升到 Q1；
+- 每隔 `boost-interval`，所有运行中的 Q1/Q2 Job 回到 Q0。
 
-- Victim resize 失败：停止当前计划并重入目标请求。
-- Target resize 失败：已回收资源保持释放，目标请求重入队；这会牺牲瞬时利用率，但不会超配。
-- Suspend 失败：Session 状态恢复到挂起前状态。
-- Resume 失败：Session 返回 `SUSPENDED`。
-- Controller 重启：当前内存版不持久化；接入数据库后应从 Session Store 与 Kubernetes actual state 做 reconciliation。
+默认值分别为 5 秒、15 秒和 30 秒。Quantum exhaustion 在普通 tick 中优先于 Aging，避免正在持续消耗 CPU 的 Job 因为仅仅停留时间较长而立即反向提权；全局 Boost 优先级最高。
 
-## 7. Kubernetes 适配要求
+## 7. Work-conserving 的原因
 
-生产适配器至少需要：
+AgentRM 只写 `cpu.weight`，从不写 `cpu.max`。
 
-1. 将 `ResizeOperation.Target` 转换为 Pod resize subresource 的 requests/limits。
-2. 用 operation generation 标注或关联异步完成事件。
-3. 监听 Pod Ready、Failed、Deleted 和 resize 状态。
-4. 调用 Kubelet Checkpoint API（Application Programming Interface）与 CRI（Container Runtime Interface，容器运行时接口）兼容运行时。
-5. 将 checkpoint 加密存储，记录 image digest、runtime version、filesystem snapshot、resource spec 和 generation。
-6. 恢复前执行镜像、内核、运行时与 checkpoint 格式兼容性检查。
+`cpu.weight` 是相对 share：只有多个 runnable cgroup 同时争用 CPU 时才影响时间分配。如果 Q0 Job 当前阻塞或不存在，Q2 Job 仍然可以使用所有剩余 CPU。因此：
+
+- 高优先级短任务能够在 contention 下获得更大 share；
+- 低优先级长任务始终有正权重并持续推进；
+- 没有 contention 时不会人为制造空闲 CPU；
+- 不需要修改 Pod resource limit 或重启 Pod。
+
+测试会创建 `cpu.max` 哨兵文件并验证权重调整后内容完全不变。
+
+## 8. Node Daemon Tick
+
+每个 tick：
+
+1. 判断是否触发 global Priority Boost；
+2. 枚举所有 `RUNNING` Job；
+3. 读取每个 cgroup 的 `cpu.stat`；
+4. 累计当前 queue 的 CPU service；
+5. 计算 quantum demotion、Aging promotion 或 Boost；
+6. 持久化 Job 状态；
+7. 读取实际 `cpu.weight`；
+8. 只在实际值与目标值不一致时写入，修复外部漂移。
+
+单个 Job 失败会记录到 tick report，不会阻塞同节点其他 Job。写权重失败时，调度状态仍保留，下一次 tick 会再次发现实际权重不一致并重试。
+
+## 9. 并发与幂等
+
+- Register、Finish 和 Tick 在单个 Daemon 内串行执行，避免同一 cgroup 的竞争写入。
+- 相同 Job 的相同注册请求幂等返回。
+- 一个 cgroup 同时只能有一个运行中 Job。
+- 已完成 Job 的 Finish 重试幂等返回。
+- Job Store 是状态源；`cpu.weight` 是被持续 reconcile 的执行状态。
+
+当前 `MemoryJobStore` 在进程重启后丢失。生产版本应接入本地持久化数据库，并在 Daemon 启动时从 Kubernetes Pod/cgroup 状态重建运行中 Job。
+
+## 10. Kubernetes 部署
+
+`deployments/kubernetes/daemonset.yaml` 将宿主机 `/sys/fs/cgroup` 挂载到容器 `/host-cgroup`。修改 cgroup controller 文件通常需要特权权限，因此示例使用 privileged container；生产环境应根据运行时和内核能力收紧为最小 Linux capability 与文件权限。
+
+关键前提：
+
+- 节点使用 cgroup v2；
+- 每个被独立调度的 Tool Job 有独立可写 cgroup；
+- cgroup 已启用 CPU controller；
+- Daemon 能可靠关联 Job、Sandbox 与相对 cgroup path。
+
+## 11. 安全边界
+
+Node Daemon 能修改宿主机 cgroup 权重，属于高权限组件：
+
+- Job lifecycle 接口不能直接暴露公网；
+- `cgroup_path` 必须限制在配置根目录内；
+- 生产接口需要节点身份认证与授权；
+- DaemonSet 应限制可调度命名空间和 Pod；
+- 日志不得包含令牌或 Sandbox 内存内容；
+- 本设计不读取进程内存，也不创建 checkpoint。
+
+## 12. 当前限制
+
+- Job Store 尚未持久化；
+- Kubernetes Agent Sandbox watcher 尚未实现，当前使用通用 lifecycle API；
+- 尚未采集节点级 utilization 与短任务延迟指标；
+- 默认权重与 quantum 需要通过真实 Coding Agent trace 校准；
+- 一个 Tool Job 必须对应可独立加权的 cgroup。
