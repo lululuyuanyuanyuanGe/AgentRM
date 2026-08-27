@@ -3,41 +3,38 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/controller"
+	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/daemon"
 	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/model"
 	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/store"
 )
 
 type Server struct {
-	controller *controller.Controller
-	logger     *slog.Logger
+	daemon *daemon.Daemon
+	logger *slog.Logger
 }
 
-func NewServer(resourceController *controller.Controller, logger *slog.Logger) *Server {
+func NewServer(nodeDaemon *daemon.Daemon, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{controller: resourceController, logger: logger}
+	return &Server{daemon: nodeDaemon, logger: logger}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /v1/cluster", s.cluster)
-	mux.HandleFunc("POST /v1/sessions", s.createSession)
-	mux.HandleFunc("GET /v1/sessions", s.listSessions)
-	mux.HandleFunc("GET /v1/sessions/{session_id}", s.getSession)
-	mux.HandleFunc("PATCH /v1/sessions/{session_id}/state", s.updateState)
-	mux.HandleFunc("PUT /v1/sessions/{session_id}/metrics", s.updateMetrics)
-	mux.HandleFunc("POST /v1/sessions/{session_id}/resources", s.requestResources)
-	mux.HandleFunc("POST /v1/sessions/{session_id}/suspend", s.suspendSession)
-	mux.HandleFunc("POST /v1/sessions/{session_id}/resume", s.resumeSession)
-	mux.HandleFunc("POST /v1/sessions/{session_id}/finish", s.finishSession)
-	mux.HandleFunc("POST /v1/scheduler/run-once", s.runSchedulerOnce)
+	mux.HandleFunc("GET /v1/config", s.config)
+	mux.HandleFunc("GET /v1/scheduler", s.schedulerSnapshot)
+	mux.HandleFunc("POST /v1/jobs", s.registerJob)
+	mux.HandleFunc("GET /v1/jobs", s.listJobs)
+	mux.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
+	mux.HandleFunc("POST /v1/jobs/{job_id}/finish", s.finishJob)
+	mux.HandleFunc("POST /v1/tick", s.tick)
 	return s.logging(mux)
 }
 
@@ -45,138 +42,81 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) cluster(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.controller.ClusterSnapshot())
+type levelResponse struct {
+	Weight      int   `json:"weight"`
+	QuantumUsec int64 `json:"quantum_usec,omitempty"`
 }
 
-type createSessionRequest struct {
-	SessionID string             `json:"session_id"`
-	Min       model.Resources    `json:"min_resource"`
-	Max       model.Resources    `json:"max_resource"`
-	Priority  model.TaskPriority `json:"task_priority"`
-}
-
-func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
-	var request createSessionRequest
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	session, err := s.controller.CreateSession(r.Context(), model.Session{
-		ID: request.SessionID, Min: request.Min, Max: request.Max, Priority: request.Priority,
+func (s *Server) config(w http.ResponseWriter, _ *http.Request) {
+	config := s.daemon.Config()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"queues": map[string]levelResponse{
+			"Q0": {Weight: config.Q0.Weight, QuantumUsec: config.Q0.Quantum.Microseconds()},
+			"Q1": {Weight: config.Q1.Weight, QuantumUsec: config.Q1.Quantum.Microseconds()},
+			"Q2": {Weight: config.Q2.Weight},
+		},
+		"q1_aging_millis": config.Q1Aging.Milliseconds(),
+		"q2_aging_millis": config.Q2Aging.Milliseconds(),
+		"boost_millis":    config.BoostInterval.Milliseconds(),
+		"idle_weight":     config.IdleWeight,
 	})
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, session)
 }
 
-func (s *Server) listSessions(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"sessions": s.controller.ListSessions()})
+func (s *Server) schedulerSnapshot(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.daemon.Snapshot())
 }
 
-func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
-	session, err := s.controller.GetSession(r.PathValue("session_id"))
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, session)
+type registerJobRequest struct {
+	JobID      string `json:"job_id"`
+	SandboxID  string `json:"sandbox_id"`
+	CgroupPath string `json:"cgroup_path"`
 }
 
-type updateStateRequest struct {
-	State    model.SessionState `json:"session_state"`
-	Priority model.TaskPriority `json:"task_priority"`
-}
-
-func (s *Server) updateState(w http.ResponseWriter, r *http.Request) {
-	var request updateStateRequest
+func (s *Server) registerJob(w http.ResponseWriter, r *http.Request) {
+	var request registerJobRequest
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	session, err := s.controller.UpdateState(r.PathValue("session_id"), request.State, request.Priority)
+	job, err := s.daemon.RegisterJob(r.Context(), request.JobID, request.SandboxID, request.CgroupPath)
 	if err != nil {
-		writeControllerError(w, err)
+		writeDaemonError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, session)
+	writeJSON(w, http.StatusCreated, job)
 }
 
-type updateMetricsRequest struct {
-	ActualCPUMilli        int64     `json:"actual_cpu_milli"`
-	MemoryWorkingSetBytes int64     `json:"memory_working_set_bytes"`
-	MemoryStableSince     time.Time `json:"memory_stable_since"`
+func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": s.daemon.ListJobs()})
 }
 
-func (s *Server) updateMetrics(w http.ResponseWriter, r *http.Request) {
-	var request updateMetricsRequest
+func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.daemon.GetJob(r.PathValue("job_id"))
+	if err != nil {
+		writeDaemonError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+type finishJobRequest struct {
+	State model.JobState `json:"state"`
+}
+
+func (s *Server) finishJob(w http.ResponseWriter, r *http.Request) {
+	request := finishJobRequest{State: model.JobFinished}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	session, err := s.controller.UpdateMetrics(r.PathValue("session_id"), request.ActualCPUMilli, request.MemoryWorkingSetBytes, request.MemoryStableSince)
+	job, err := s.daemon.FinishJob(r.Context(), r.PathValue("job_id"), request.State)
 	if err != nil {
-		writeControllerError(w, err)
+		writeDaemonError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, session)
+	writeJSON(w, http.StatusOK, job)
 }
 
-type resourceRequest struct {
-	Desired    model.Resources    `json:"desired_resource"`
-	Generation int64              `json:"generation"`
-	Priority   model.TaskPriority `json:"priority"`
-}
-
-func (s *Server) requestResources(w http.ResponseWriter, r *http.Request) {
-	var request resourceRequest
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	session, err := s.controller.RequestResources(model.ResourceRequest{
-		SessionID: r.PathValue("session_id"), Desired: request.Desired,
-		Generation: request.Generation, Priority: request.Priority,
-	})
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, session)
-}
-
-func (s *Server) suspendSession(w http.ResponseWriter, r *http.Request) {
-	session, err := s.controller.SuspendSession(r.Context(), r.PathValue("session_id"))
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, session)
-}
-
-func (s *Server) resumeSession(w http.ResponseWriter, r *http.Request) {
-	session, err := s.controller.ResumeSession(r.Context(), r.PathValue("session_id"))
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, session)
-}
-
-func (s *Server) finishSession(w http.ResponseWriter, r *http.Request) {
-	session, err := s.controller.FinishSession(r.Context(), r.PathValue("session_id"))
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, session)
-}
-
-func (s *Server) runSchedulerOnce(w http.ResponseWriter, r *http.Request) {
-	plan, processed, err := s.controller.ProcessNext(r.Context())
-	if err != nil {
-		writeControllerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"processed": processed, "plan": plan})
+func (s *Server) tick(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.daemon.Tick(r.Context()))
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -186,17 +126,19 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return false
 	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain one JSON object"})
+		return false
+	}
 	return true
 }
 
-func writeControllerError(w http.ResponseWriter, err error) {
+func writeDaemonError(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrSessionNotFound) {
+	if errors.Is(err, store.ErrJobNotFound) {
 		status = http.StatusNotFound
-	} else if errors.Is(err, store.ErrSessionExists) || errors.Is(err, controller.ErrGenerationConflict) {
+	} else if errors.Is(err, store.ErrJobExists) || errors.Is(err, daemon.ErrCgroupBusy) {
 		status = http.StatusConflict
-	} else if errors.Is(err, controller.ErrInsufficientMinimum) {
-		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
