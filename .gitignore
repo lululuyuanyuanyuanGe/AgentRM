@@ -19,3 +19,4 @@ __pycache__/
 # Local configuration and state
 *.local.json
 /data/
+/bpf/*.o
