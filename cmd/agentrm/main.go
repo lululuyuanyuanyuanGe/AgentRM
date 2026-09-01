@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -10,40 +11,43 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/accounting"
 	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/api"
 	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/cgroup"
-	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/daemon"
+	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/discovery"
 	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/mlfq"
+	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/scheduler"
 	"github.com/lululuyuanyuanyuanGe/AgentRM/internal/store"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 func main() {
 	listenAddress := flag.String("listen", ":8080", "HTTP listen address")
+	nodeName := flag.String("node-name", os.Getenv("NODE_NAME"), "Kubernetes node managed by this daemon")
+	kubeconfig := flag.String("kubeconfig", "", "optional kubeconfig path; defaults to in-cluster credentials")
 	cgroupRoot := flag.String("cgroup-root", "/sys/fs/cgroup", "cgroup v2 mount root")
-	sampleInterval := flag.Duration("sample-interval", 100*time.Millisecond, "cpu.stat sample interval")
-	q0Weight := flag.Int("q0-weight", 10000, "Q0 cpu.weight")
-	q1Weight := flag.Int("q1-weight", 3000, "Q1 cpu.weight")
-	q2Weight := flag.Int("q2-weight", 500, "Q2 cpu.weight")
-	q0Quantum := flag.Duration("q0-quantum", 250*time.Millisecond, "Q0 CPU service quantum")
-	q1Quantum := flag.Duration("q1-quantum", 2*time.Second, "Q1 CPU service quantum")
-	q1Aging := flag.Duration("q1-aging", 5*time.Second, "Q1 aging threshold")
-	q2Aging := flag.Duration("q2-aging", 15*time.Second, "Q2 aging threshold")
-	boostInterval := flag.Duration("boost-interval", 30*time.Second, "global priority boost interval")
-	idleWeight := flag.Int("idle-weight", 100, "cpu.weight restored after a job finishes")
+	bpfObject := flag.String("bpf-object", "/usr/lib/agentrm/agentrm.bpf.o", "compiled AgentRM eBPF object")
+	q0Weight := flag.Int("q0-weight", 1000, "Q0 cpu.weight")
+	q1Weight := flag.Int("q1-weight", 300, "Q1 cpu.weight")
+	q2Weight := flag.Int("q2-weight", 100, "Q2 cpu.weight")
+	q0Budget := flag.Duration("q0-budget", 4*time.Second, "Q0 CPU service credit")
+	q1Budget := flag.Duration("q1-budget", 20*time.Second, "Q1 CPU service credit")
+	boostInterval := flag.Duration("boost-interval", 60*time.Second, "global priority boost interval")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if *sampleInterval <= 0 {
-		logger.Error("sample interval must be positive")
+	if *nodeName == "" {
+		logger.Error("node name is required; use --node-name or NODE_NAME")
 		os.Exit(2)
 	}
-	config := mlfq.Config{
-		Q0:      mlfq.LevelConfig{Weight: *q0Weight, Quantum: *q0Quantum},
-		Q1:      mlfq.LevelConfig{Weight: *q1Weight, Quantum: *q1Quantum},
-		Q2:      mlfq.LevelConfig{Weight: *q2Weight},
-		Q1Aging: *q1Aging, Q2Aging: *q2Aging, BoostInterval: *boostInterval, IdleWeight: *idleWeight,
-	}
-	engine, err := mlfq.New(config)
+	policy, err := mlfq.NewPolicy(mlfq.SessionConfig{
+		Q0:            mlfq.SessionLevel{Weight: *q0Weight, Budget: *q0Budget},
+		Q1:            mlfq.SessionLevel{Weight: *q1Weight, Budget: *q1Budget},
+		Q2:            mlfq.SessionLevel{Weight: *q2Weight},
+		BoostInterval: *boostInterval,
+	})
 	if err != nil {
 		logger.Error("invalid MLFQ configuration", "error", err)
 		os.Exit(2)
@@ -53,51 +57,66 @@ func main() {
 		logger.Error("invalid cgroup root", "error", err)
 		os.Exit(2)
 	}
-	nodeDaemon := daemon.New(store.NewMemoryJobStore(), cgroups, engine)
-
+	resolver, err := cgroup.NewFSResolver(*cgroupRoot)
+	if err != nil {
+		logger.Error("create cgroup resolver", "error", err)
+		os.Exit(2)
+	}
+	accountant, err := accounting.NewKernelSource(*bpfObject)
+	if err != nil {
+		logger.Error("start kernel CPU accounting", "error", err)
+		os.Exit(1)
+	}
+	defer accountant.Close()
+	kubeConfig, err := kubernetesConfig(*kubeconfig)
+	if err != nil {
+		logger.Error("create Kubernetes configuration", "error", err)
+		os.Exit(1)
+	}
+	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		logger.Error("create Kubernetes client", "error", err)
+		os.Exit(1)
+	}
+	podWatcher, err := discovery.NewWatcher(kubeClient, *nodeName, logger)
+	if err != nil {
+		logger.Error("create Agent Sandbox watcher", "error", err)
+		os.Exit(1)
+	}
+	nodeScheduler, err := scheduler.NewController(
+		store.NewMemorySandboxStore(), cgroups, resolver, accountant, policy, logger,
+	)
+	if err != nil {
+		logger.Error("create node scheduler", "error", err)
+		os.Exit(1)
+	}
 	server := &http.Server{
-		Addr:              *listenAddress,
-		Handler:           api.NewServer(nodeDaemon, logger).Handler(),
+		Addr: *listenAddress, Handler: api.NewServer(nodeScheduler, logger).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go reconcile(ctx, logger, nodeDaemon, *sampleInterval)
-	go func() {
-		<-ctx.Done()
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownContext)
-	}()
+	errCh := make(chan error, 3)
+	go func() { errCh <- podWatcher.Run(ctx) }()
+	go func() { errCh <- nodeScheduler.Run(ctx, podWatcher.Events()) }()
+	go func() { errCh <- server.ListenAndServe() }()
 
-	logger.Info("AgentRM node daemon started", "listen", *listenAddress, "cgroup_root", *cgroupRoot, "sample_interval", *sampleInterval)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("server stopped unexpectedly", "error", err)
+	logger.Info("AgentRM node daemon started", "node", *nodeName, "listen", *listenAddress, "cgroup_root", *cgroupRoot, "bpf_object", *bpfObject)
+	runErr := <-errCh
+	stop()
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdownContext)
+	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, http.ErrServerClosed) {
+		logger.Error("AgentRM stopped unexpectedly", "error", runErr)
 		os.Exit(1)
 	}
 }
 
-func reconcile(ctx context.Context, logger *slog.Logger, nodeDaemon *daemon.Daemon, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			report := nodeDaemon.Tick(ctx)
-			if report.PriorityBoost {
-				logger.Info("global MLFQ priority boost")
-			}
-			for _, result := range report.Jobs {
-				if result.Error != "" {
-					logger.Error("job reconcile failed", "job_id", result.JobID, "error", result.Error)
-					continue
-				}
-				if result.Evaluation != nil && result.Evaluation.LevelChanged {
-					logger.Info("job queue changed", "job_id", result.JobID, "from", result.Evaluation.PreviousLevel, "to", result.Evaluation.Job.Level, "reason", result.Evaluation.Reason, "cpu_weight", result.Evaluation.Job.CPUWeight)
-				}
-			}
-		}
+func kubernetesConfig(kubeconfig string) (*rest.Config, error) {
+	if kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
 	}
+	return rest.InClusterConfig()
 }

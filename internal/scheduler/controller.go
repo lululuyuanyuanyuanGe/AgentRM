@@ -224,6 +224,8 @@ func (c *Controller) Boost(ctx context.Context) error {
 
 func (c *Controller) Sandboxes() []model.SandboxEntity { return c.store.List() }
 
+func (c *Controller) Config() mlfq.SessionConfig { return c.policy.Config() }
+
 func (c *Controller) Snapshot() Snapshot {
 	snapshot := Snapshot{}
 	for _, entity := range c.store.List() {

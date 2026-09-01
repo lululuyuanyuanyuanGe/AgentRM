@@ -6,6 +6,29 @@ import (
 	"time"
 )
 
+type QueueLevel string
+
+const (
+	QueueQ0 QueueLevel = "Q0"
+	QueueQ1 QueueLevel = "Q1"
+	QueueQ2 QueueLevel = "Q2"
+)
+
+func (q QueueLevel) Valid() bool {
+	return q == QueueQ0 || q == QueueQ1 || q == QueueQ2
+}
+
+func (q QueueLevel) Demote() QueueLevel {
+	switch q {
+	case QueueQ0:
+		return QueueQ1
+	case QueueQ1:
+		return QueueQ2
+	default:
+		return QueueQ2
+	}
+}
+
 // SandboxEntity is one Agent Sandbox backing Pod tracked by the node scheduler.
 // Queue credit belongs to the session and is never reset by individual tool calls.
 type SandboxEntity struct {
