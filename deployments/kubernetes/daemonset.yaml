@@ -1,3 +1,31 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentrm
+  namespace: agent-sandbox-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentrm
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agentrm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agentrm
+subjects:
+  - kind: ServiceAccount
+    name: agentrm
+    namespace: agent-sandbox-system
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -14,6 +42,8 @@ spec:
       labels:
         app.kubernetes.io/name: agentrm
     spec:
+      serviceAccountName: agentrm
+      terminationGracePeriodSeconds: 10
       containers:
         - name: agentrm
           image: ghcr.io/lululuyuanyuanyuanGe/agentrm:latest
@@ -21,26 +51,48 @@ spec:
           args:
             - --listen=:8080
             - --cgroup-root=/host-cgroup
-            - --sample-interval=100ms
-            - --q0-weight=10000
-            - --q1-weight=3000
-            - --q2-weight=500
-            - --q0-quantum=250ms
-            - --q1-quantum=2s
-            - --q1-aging=5s
-            - --q2-aging=15s
-            - --boost-interval=30s
+            - --bpf-object=/usr/lib/agentrm/agentrm.bpf.o
+            - --q0-weight=1000
+            - --q1-weight=300
+            - --q2-weight=100
+            - --q0-budget=4s
+            - --q1-budget=20s
+            - --boost-interval=60s
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           ports:
             - name: http
               containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
           securityContext:
             privileged: true
+            runAsUser: 0
             readOnlyRootFilesystem: true
           volumeMounts:
             - name: cgroup
               mountPath: /host-cgroup
+            - name: tracing
+              mountPath: /sys/kernel/tracing
+              readOnly: true
       volumes:
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
+            type: Directory
+        - name: tracing
+          hostPath:
+            path: /sys/kernel/tracing
             type: Directory

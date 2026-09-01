@@ -22,8 +22,7 @@ type bpfEntityState struct {
 	BudgetNS   uint64
 	Level      uint32
 	Generation uint32
-	Reported   uint32
-	Padding    uint32
+	Reported   uint64
 }
 
 type bpfThresholdEvent struct {

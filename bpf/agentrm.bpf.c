@@ -7,8 +7,7 @@ struct entity_state {
     __u64 budget_ns;
     __u32 level;
     __u32 generation;
-    __u32 reported;
-    __u32 padding;
+    __u64 reported;
 };
 
 struct threshold_event {
