@@ -92,6 +92,26 @@ func TestControllerIgnoresStaleRingBufferEventAfterBoost(t *testing.T) {
 	}
 }
 
+func TestRepeatedPodUpdateDoesNotRefreshSessionCredit(t *testing.T) {
+	groups := cgroup.NewMemoryClient()
+	groups.Add("pod-a", cgroup.CPUStat{}, 100)
+	accountant := accounting.NewMemorySource()
+	policy, _ := mlfq.NewPolicy(mlfq.DefaultSessionConfig())
+	controller, _ := NewController(store.NewMemorySandboxStore(), groups, staticResolver{cgroup.Location{Path: "pod-a", ID: 7}}, accountant, policy, nil)
+	pod := discovery.SandboxPod{Type: discovery.EventUpsert, Namespace: "n", SandboxName: "s", SandboxUID: "s1", PodName: "p", PodUID: "p1", NodeName: "node", Phase: corev1.PodRunning}
+	_ = controller.HandlePod(context.Background(), pod)
+	_ = accountant.Exhaust(7)
+	_ = controller.HandleThreshold(context.Background(), <-accountant.Events())
+
+	if err := controller.HandlePod(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	entity := controller.Sandboxes()[0]
+	if entity.Level != model.QueueQ1 || entity.Generation != 2 {
+		t.Fatalf("ordinary Pod update refreshed session credit: %#v", entity)
+	}
+}
+
 func TestControllerRemovesDeletedSandboxPod(t *testing.T) {
 	groups := cgroup.NewMemoryClient()
 	groups.Add("pod-a", cgroup.CPUStat{}, 100)

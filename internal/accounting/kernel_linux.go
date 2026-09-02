@@ -17,23 +17,6 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-type bpfEntityState struct {
-	UsedNS     uint64
-	BudgetNS   uint64
-	Level      uint32
-	Generation uint32
-	Reported   uint64
-}
-
-type bpfThresholdEvent struct {
-	CgroupID    uint64
-	UsedNS      uint64
-	BudgetNS    uint64
-	TimestampNS uint64
-	Level       uint32
-	Generation  uint32
-}
-
 type kernelObjects struct {
 	Entities       *ebpf.Map     `ebpf:"entities"`
 	Events         *ebpf.Map     `ebpf:"events"`
