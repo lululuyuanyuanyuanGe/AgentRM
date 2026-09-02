@@ -32,26 +32,25 @@ func (q QueueLevel) Demote() QueueLevel {
 // SandboxEntity is one Agent Sandbox backing Pod tracked by the node scheduler.
 // Queue credit belongs to the session and is never reset by individual tool calls.
 type SandboxEntity struct {
-	Namespace        string     `json:"namespace"`
-	SandboxName      string     `json:"sandbox_name"`
-	SandboxUID       string     `json:"sandbox_uid"`
-	PodName          string     `json:"pod_name"`
-	PodUID           string     `json:"pod_uid"`
-	NodeName         string     `json:"node_name"`
-	CgroupPath       string     `json:"cgroup_path"`
-	CgroupID         uint64     `json:"cgroup_id"`
-	MemberCgroupIDs  []uint64   `json:"member_cgroup_ids"`
-	Level            QueueLevel `json:"queue"`
-	CPUWeight        int        `json:"cpu_weight"`
-	BudgetNS         uint64     `json:"budget_ns,omitempty"`
-	ServiceInLevelNS uint64     `json:"service_in_level_ns"`
-	AccountedNS      uint64     `json:"accounted_ns"`
-	Generation       uint32     `json:"generation"`
-	Demotions        int        `json:"demotions"`
-	Promotions       int        `json:"promotions"`
-	StartedAt        time.Time  `json:"started_at"`
-	LevelEnteredAt   time.Time  `json:"level_entered_at"`
-	LastEventAt      time.Time  `json:"last_event_at"`
+	Namespace       string     `json:"namespace"`
+	SandboxName     string     `json:"sandbox_name"`
+	SandboxUID      string     `json:"sandbox_uid"`
+	PodName         string     `json:"pod_name"`
+	PodUID          string     `json:"pod_uid"`
+	NodeName        string     `json:"node_name"`
+	CgroupPath      string     `json:"cgroup_path"`
+	CgroupID        uint64     `json:"cgroup_id"`
+	MemberCgroupIDs []uint64   `json:"member_cgroup_ids"`
+	Level           QueueLevel `json:"queue"`
+	CPUWeight       int        `json:"cpu_weight"`
+	BudgetNS        uint64     `json:"budget_ns,omitempty"`
+	AccountedNS     uint64     `json:"accounted_ns"`
+	Generation      uint32     `json:"generation"`
+	Demotions       int        `json:"demotions"`
+	Promotions      int        `json:"promotions"`
+	StartedAt       time.Time  `json:"started_at"`
+	LevelEnteredAt  time.Time  `json:"level_entered_at"`
+	LastEventAt     time.Time  `json:"last_event_at"`
 }
 
 func (s SandboxEntity) Key() string { return s.PodUID }

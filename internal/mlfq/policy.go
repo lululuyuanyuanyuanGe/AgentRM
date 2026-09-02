@@ -83,7 +83,6 @@ func (p *Policy) Demote(entity model.SandboxEntity, usedNS uint64, now time.Time
 		return model.SandboxEntity{}, fmt.Errorf("CPU service %d did not exhaust budget %d", usedNS, entity.BudgetNS)
 	}
 	entity.AccountedNS += usedNS
-	entity.ServiceInLevelNS = 0
 	entity.Level = entity.Level.Demote()
 	entity.CPUWeight = p.Weight(entity.Level)
 	entity.BudgetNS = p.BudgetNS(entity.Level)
@@ -104,7 +103,6 @@ func (p *Policy) Boost(entity model.SandboxEntity, now time.Time) (model.Sandbox
 	entity.Level = model.QueueQ0
 	entity.CPUWeight = p.Weight(model.QueueQ0)
 	entity.BudgetNS = p.BudgetNS(model.QueueQ0)
-	entity.ServiceInLevelNS = 0
 	entity.Generation++
 	entity.Promotions++
 	entity.LevelEnteredAt = now
