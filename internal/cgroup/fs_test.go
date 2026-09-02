@@ -33,7 +33,7 @@ func TestParseCPUStatRequiresUsage(t *testing.T) {
 
 func TestFSClientReadsStatAndChangesOnlyWeight(t *testing.T) {
 	root := t.TempDir()
-	group := filepath.Join(root, "kubepods", "sandbox-a", "job-a")
+	group := filepath.Join(root, "kubepods", "burstable", "pod-a")
 	if err := os.MkdirAll(group, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -45,18 +45,18 @@ func TestFSClientReadsStatAndChangesOnlyWeight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stat, err := client.ReadCPUStat(context.Background(), "kubepods/sandbox-a/job-a")
+	stat, err := client.ReadCPUStat(context.Background(), "kubepods/burstable/pod-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stat.UsageUsec != 420 {
 		t.Fatalf("usage = %d, want 420", stat.UsageUsec)
 	}
-	if err := client.WriteWeight(context.Background(), "kubepods/sandbox-a/job-a", 3000); err != nil {
+	if err := client.WriteWeight(context.Background(), "kubepods/burstable/pod-a", 300); err != nil {
 		t.Fatal(err)
 	}
-	weight, err := client.ReadWeight(context.Background(), "kubepods/sandbox-a/job-a")
-	if err != nil || weight != 3000 {
+	weight, err := client.ReadWeight(context.Background(), "kubepods/burstable/pod-a")
+	if err != nil || weight != 300 {
 		t.Fatalf("weight=%d err=%v", weight, err)
 	}
 	quota, err := os.ReadFile(filepath.Join(group, "cpu.max"))
