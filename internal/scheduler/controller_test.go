@@ -20,6 +20,12 @@ func (r staticResolver) ResolvePod(context.Context, string) (cgroup.Location, er
 	return r.location, nil
 }
 
+type mutableResolver struct{ location cgroup.Location }
+
+func (r *mutableResolver) ResolvePod(context.Context, string) (cgroup.Location, error) {
+	return r.location, nil
+}
+
 func TestControllerAdmitsBackingPodAndDemotesFromKernelEvents(t *testing.T) {
 	groups := cgroup.NewMemoryClient()
 	groups.Add("kubepods/pod-a", cgroup.CPUStat{}, 100)
@@ -109,6 +115,32 @@ func TestRepeatedPodUpdateDoesNotRefreshSessionCredit(t *testing.T) {
 	entity := controller.Sandboxes()[0]
 	if entity.Level != model.QueueQ1 || entity.Generation != 2 {
 		t.Fatalf("ordinary Pod update refreshed session credit: %#v", entity)
+	}
+}
+
+func TestPodUpdateAddsRestartedContainerWithoutRefreshingCredit(t *testing.T) {
+	groups := cgroup.NewMemoryClient()
+	groups.Add("pod-a", cgroup.CPUStat{}, 100)
+	accountant := accounting.NewMemorySource()
+	policy, _ := mlfq.NewPolicy(mlfq.DefaultSessionConfig())
+	resolver := &mutableResolver{location: cgroup.Location{Path: "pod-a", ID: 7, MemberIDs: []uint64{7, 8}}}
+	controller, _ := NewController(store.NewMemorySandboxStore(), groups, resolver, accountant, policy, nil)
+	pod := discovery.SandboxPod{Type: discovery.EventUpsert, Namespace: "n", SandboxName: "s", SandboxUID: "s1", PodName: "p", PodUID: "p1", NodeName: "node", Phase: corev1.PodRunning}
+	_ = controller.HandlePod(context.Background(), pod)
+	_ = accountant.Exhaust(7)
+	_ = controller.HandleThreshold(context.Background(), <-accountant.Events())
+
+	resolver.location.MemberIDs = []uint64{7, 9}
+	if err := controller.HandlePod(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	entity := controller.Sandboxes()[0]
+	config, _ := accountant.Configuration(7)
+	if entity.Level != model.QueueQ1 || entity.Generation != 2 {
+		t.Fatalf("container restart refreshed Sandbox credit: %#v", entity)
+	}
+	if len(config.MemberIDs) != 2 || config.MemberIDs[1] != 9 {
+		t.Fatalf("member cgroups were not refreshed: %v", config.MemberIDs)
 	}
 }
 

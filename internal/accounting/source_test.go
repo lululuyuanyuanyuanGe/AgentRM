@@ -8,7 +8,7 @@ import (
 
 func TestMemorySourceKeepsKernelConfigurationSemantics(t *testing.T) {
 	source := NewMemorySource()
-	config := Configuration{CgroupID: 77, Level: LevelQ0, BudgetNS: uint64(4 * time.Second), Generation: 1}
+	config := Configuration{CgroupID: 77, MemberIDs: []uint64{77, 78}, Level: LevelQ0, BudgetNS: uint64(4 * time.Second), Generation: 1}
 	if err := source.Configure(context.Background(), config); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestMemorySourceKeepsKernelConfigurationSemantics(t *testing.T) {
 }
 
 func TestAccountingConfigurationRejectsBudgetOnQ2(t *testing.T) {
-	config := Configuration{CgroupID: 1, Level: LevelQ2, BudgetNS: 1, Generation: 1}
+	config := Configuration{CgroupID: 1, MemberIDs: []uint64{1}, Level: LevelQ2, BudgetNS: 1, Generation: 1}
 	if err := config.Validate(); err == nil {
 		t.Fatal("expected Q2 finite budget to fail")
 	}

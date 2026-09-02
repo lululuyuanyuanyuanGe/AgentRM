@@ -18,8 +18,9 @@ var (
 )
 
 type Location struct {
-	Path string
-	ID   uint64
+	Path      string
+	ID        uint64
+	MemberIDs []uint64
 }
 
 type PodResolver interface {
@@ -90,7 +91,38 @@ func (r *FSResolver) location(path string) (Location, error) {
 	if err != nil {
 		return Location{}, fmt.Errorf("make cgroup path relative: %w", err)
 	}
-	return Location{Path: relative, ID: stat.Ino}, nil
+	members, err := descendantIDs(path)
+	if err != nil {
+		return Location{}, err
+	}
+	return Location{Path: relative, ID: stat.Ino, MemberIDs: members}, nil
+}
+
+func descendantIDs(root string) ([]uint64, error) {
+	var ids []uint64
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Ino == 0 {
+			return fmt.Errorf("cgroup inode is unavailable for %s", path)
+		}
+		ids = append(ids, stat.Ino)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate Pod cgroup members: %w", err)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
 }
 
 func podDirectory(name, uid, systemdUID string) bool {

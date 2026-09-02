@@ -26,6 +26,14 @@ struct {
     __type(value, struct entity_state);
 } entities SEC(".maps");
 
+/* Maps the current task's leaf/container cgroup to its Sandbox Pod cgroup. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 32768);
+    __type(key, __u64);
+    __type(value, __u64);
+} memberships SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -49,8 +57,14 @@ int account_runtime(void *ctx)
         return 0;
 
     if (*last != 0) {
-        __u64 cgroup_id = bpf_get_current_cgroup_id();
-        struct entity_state *state = bpf_map_lookup_elem(&entities, &cgroup_id);
+        __u64 leaf_cgroup_id = bpf_get_current_cgroup_id();
+        __u64 *cgroup_id = bpf_map_lookup_elem(&memberships, &leaf_cgroup_id);
+        struct entity_state *state;
+
+        if (!cgroup_id)
+            goto done;
+
+        state = bpf_map_lookup_elem(&entities, cgroup_id);
 
         if (state && state->budget_ns != 0 && state->reported == 0) {
             __u64 delta = now - *last;
@@ -63,7 +77,7 @@ int account_runtime(void *ctx)
 
                 event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
                 if (event) {
-                    event->cgroup_id = cgroup_id;
+                    event->cgroup_id = *cgroup_id;
                     event->used_ns = used;
                     event->budget_ns = state->budget_ns;
                     event->timestamp_ns = now;
@@ -78,6 +92,7 @@ int account_runtime(void *ctx)
         }
     }
 
+done:
     *last = now;
     return 0;
 }

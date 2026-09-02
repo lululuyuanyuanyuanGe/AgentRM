@@ -16,6 +16,7 @@ const (
 
 type Configuration struct {
 	CgroupID   uint64
+	MemberIDs  []uint64
 	BudgetNS   uint64
 	Level      Level
 	Generation uint32
@@ -24,6 +25,14 @@ type Configuration struct {
 func (c Configuration) Validate() error {
 	if c.CgroupID == 0 {
 		return errors.New("cgroup ID is required")
+	}
+	if len(c.MemberIDs) == 0 {
+		return errors.New("at least one member cgroup ID is required")
+	}
+	for _, id := range c.MemberIDs {
+		if id == 0 {
+			return errors.New("member cgroup ID must be non-zero")
+		}
 	}
 	if c.Level > LevelQ2 {
 		return errors.New("accounting level is invalid")
@@ -51,6 +60,7 @@ type Event struct {
 
 type Source interface {
 	Configure(context.Context, Configuration) error
+	SyncMembers(context.Context, uint64, []uint64) error
 	Remove(context.Context, uint64) error
 	Events() <-chan Event
 	Errors() <-chan error
@@ -80,6 +90,21 @@ func (s *MemorySource) Configure(_ context.Context, config Configuration) error 
 	s.mu.Lock()
 	s.configs[config.CgroupID] = config
 	s.mu.Unlock()
+	return nil
+}
+
+func (s *MemorySource) SyncMembers(_ context.Context, cgroupID uint64, memberIDs []uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	config, ok := s.configs[cgroupID]
+	if !ok {
+		return errors.New("cgroup is not configured")
+	}
+	if len(memberIDs) == 0 {
+		return errors.New("at least one member cgroup ID is required")
+	}
+	config.MemberIDs = append([]uint64(nil), memberIDs...)
+	s.configs[cgroupID] = config
 	return nil
 }
 

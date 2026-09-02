@@ -64,6 +64,6 @@ func validSandbox() model.SandboxEntity {
 	return model.SandboxEntity{
 		Namespace: "agents", SandboxName: "session-a", SandboxUID: "sandbox-uid",
 		PodName: "session-a", PodUID: "pod-uid", NodeName: "worker-a",
-		CgroupPath: "kubepods.slice/pod.slice", CgroupID: 42,
+		CgroupPath: "kubepods.slice/pod.slice", CgroupID: 42, MemberCgroupIDs: []uint64{42, 43},
 	}
 }

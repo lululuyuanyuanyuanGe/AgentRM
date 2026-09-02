@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -134,9 +135,32 @@ func (c *Controller) HandlePod(ctx context.Context, pod discovery.SandboxPod) er
 		delete(c.pendingPods, pod.PodUID)
 		return c.removePodLocked(ctx, pod.PodUID)
 	}
-	if _, err := c.store.GetByPodUID(pod.PodUID); err == nil {
-		delete(c.pendingPods, pod.PodUID)
-		return nil
+	if existing, err := c.store.GetByPodUID(pod.PodUID); err == nil {
+		location, resolveErr := c.resolver.ResolvePod(ctx, pod.PodUID)
+		if resolveErr != nil {
+			c.pendingPods[pod.PodUID] = pod
+			return fmt.Errorf("refresh Pod cgroup members: %w", resolveErr)
+		}
+		members := location.MemberIDs
+		if len(members) == 0 {
+			members = []uint64{location.ID}
+		}
+		if location.ID != existing.CgroupID {
+			if err := c.removePodLocked(ctx, pod.PodUID); err != nil {
+				return fmt.Errorf("replace changed Pod cgroup: %w", err)
+			}
+		} else {
+			if !slices.Equal(existing.MemberCgroupIDs, members) {
+				if err := c.accounting.SyncMembers(ctx, existing.CgroupID, members); err != nil {
+					c.pendingPods[pod.PodUID] = pod
+					return fmt.Errorf("sync container cgroup membership: %w", err)
+				}
+				existing.MemberCgroupIDs = append([]uint64(nil), members...)
+				c.store.Upsert(existing)
+			}
+			delete(c.pendingPods, pod.PodUID)
+			return nil
+		}
 	} else if !errors.Is(err, store.ErrSandboxNotFound) {
 		return err
 	}
@@ -148,10 +172,14 @@ func (c *Controller) HandlePod(ctx context.Context, pod discovery.SandboxPod) er
 	if existing, err := c.store.GetByCgroupID(location.ID); err == nil && existing.PodUID != pod.PodUID {
 		return fmt.Errorf("cgroup ID %d is already owned by Pod %s", location.ID, existing.PodUID)
 	}
+	members := location.MemberIDs
+	if len(members) == 0 {
+		members = []uint64{location.ID}
+	}
 	entity, err := c.policy.NewSandbox(model.SandboxEntity{
 		Namespace: pod.Namespace, SandboxName: pod.SandboxName, SandboxUID: pod.SandboxUID,
 		PodName: pod.PodName, PodUID: pod.PodUID, NodeName: pod.NodeName,
-		CgroupPath: location.Path, CgroupID: location.ID,
+		CgroupPath: location.Path, CgroupID: location.ID, MemberCgroupIDs: members,
 	}, c.now())
 	if err != nil {
 		return err
@@ -297,7 +325,7 @@ func (c *Controller) retry(ctx context.Context) {
 
 func accountingConfig(entity model.SandboxEntity) accounting.Configuration {
 	return accounting.Configuration{
-		CgroupID: entity.CgroupID, BudgetNS: entity.BudgetNS,
+		CgroupID: entity.CgroupID, MemberIDs: entity.MemberCgroupIDs, BudgetNS: entity.BudgetNS,
 		Level: accountingLevel(entity.Level), Generation: entity.Generation,
 	}
 }

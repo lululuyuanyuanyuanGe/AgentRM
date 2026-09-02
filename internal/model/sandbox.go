@@ -40,6 +40,7 @@ type SandboxEntity struct {
 	NodeName         string     `json:"node_name"`
 	CgroupPath       string     `json:"cgroup_path"`
 	CgroupID         uint64     `json:"cgroup_id"`
+	MemberCgroupIDs  []uint64   `json:"member_cgroup_ids"`
 	Level            QueueLevel `json:"queue"`
 	CPUWeight        int        `json:"cpu_weight"`
 	BudgetNS         uint64     `json:"budget_ns,omitempty"`
@@ -66,6 +67,9 @@ func (s SandboxEntity) Validate() error {
 	}
 	if s.CgroupID == 0 {
 		return errors.New("cgroup_id is required")
+	}
+	if len(s.MemberCgroupIDs) == 0 {
+		return errors.New("member_cgroup_ids is required")
 	}
 	if !s.Level.Valid() {
 		return errors.New("queue level is invalid")

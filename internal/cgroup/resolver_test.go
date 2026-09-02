@@ -23,6 +23,9 @@ func TestResolvePodSystemdLayout(t *testing.T) {
 	if location.Path != filepath.Join("kubepods.slice", "kubepods-burstable.slice", filepath.Base(group)) || location.ID == 0 {
 		t.Fatalf("location = %#v", location)
 	}
+	if len(location.MemberIDs) != 2 {
+		t.Fatalf("member cgroup IDs = %v, want Pod and container", location.MemberIDs)
+	}
 }
 
 func TestResolvePodCgroupFSLayout(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 
 type kernelObjects struct {
 	Entities       *ebpf.Map     `ebpf:"entities"`
+	Memberships    *ebpf.Map     `ebpf:"memberships"`
 	Events         *ebpf.Map     `ebpf:"events"`
 	AccountRuntime *ebpf.Program `ebpf:"account_runtime"`
 }
@@ -30,19 +31,24 @@ func (o *kernelObjects) Close() {
 	if o.Entities != nil {
 		o.Entities.Close()
 	}
+	if o.Memberships != nil {
+		o.Memberships.Close()
+	}
 	if o.Events != nil {
 		o.Events.Close()
 	}
 }
 
 type KernelSource struct {
-	objects kernelObjects
-	hook    link.Link
-	reader  *ringbuf.Reader
-	events  chan Event
-	errors  chan error
-	close   sync.Once
-	wg      sync.WaitGroup
+	objects   kernelObjects
+	hook      link.Link
+	reader    *ringbuf.Reader
+	events    chan Event
+	errors    chan error
+	close     sync.Once
+	wg        sync.WaitGroup
+	membersMu sync.Mutex
+	members   map[uint64][]uint64
 }
 
 func NewKernelSource(objectPath string) (*KernelSource, error) {
@@ -56,7 +62,7 @@ func NewKernelSource(objectPath string) (*KernelSource, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load eBPF collection spec: %w", err)
 	}
-	source := &KernelSource{events: make(chan Event, 256), errors: make(chan error, 8)}
+	source := &KernelSource{events: make(chan Event, 256), errors: make(chan error, 8), members: make(map[uint64][]uint64)}
 	if err := spec.LoadAndAssign(&source.objects, nil); err != nil {
 		return nil, fmt.Errorf("load eBPF objects: %w", err)
 	}
@@ -81,13 +87,67 @@ func (s *KernelSource) Configure(_ context.Context, config Configuration) error 
 		return err
 	}
 	state := bpfEntityState{BudgetNS: config.BudgetNS, Level: uint32(config.Level), Generation: config.Generation}
+	var previous bpfEntityState
+	hadPrevious := s.objects.Entities.Lookup(config.CgroupID, &previous) == nil
 	if err := s.objects.Entities.Put(config.CgroupID, state); err != nil {
 		return fmt.Errorf("configure cgroup accounting: %w", err)
+	}
+	if err := s.SyncMembers(context.Background(), config.CgroupID, config.MemberIDs); err != nil {
+		if hadPrevious {
+			_ = s.objects.Entities.Put(config.CgroupID, previous)
+		} else {
+			_ = s.objects.Entities.Delete(config.CgroupID)
+		}
+		return err
 	}
 	return nil
 }
 
+func (s *KernelSource) SyncMembers(_ context.Context, cgroupID uint64, memberIDs []uint64) error {
+	if cgroupID == 0 || len(memberIDs) == 0 {
+		return errors.New("cgroup ID and member cgroup IDs are required")
+	}
+	s.membersMu.Lock()
+	defer s.membersMu.Unlock()
+	next := make(map[uint64]struct{}, len(memberIDs))
+	for _, memberID := range memberIDs {
+		if memberID == 0 {
+			return errors.New("member cgroup ID must be non-zero")
+		}
+		var owner uint64
+		if err := s.objects.Memberships.Lookup(memberID, &owner); err == nil && owner != cgroupID {
+			return fmt.Errorf("member cgroup ID %d belongs to Sandbox cgroup %d", memberID, owner)
+		} else if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("lookup cgroup membership: %w", err)
+		}
+		if err := s.objects.Memberships.Put(memberID, cgroupID); err != nil {
+			return fmt.Errorf("store cgroup membership: %w", err)
+		}
+		next[memberID] = struct{}{}
+	}
+	for _, previousID := range s.members[cgroupID] {
+		if _, keep := next[previousID]; keep {
+			continue
+		}
+		var owner uint64
+		if err := s.objects.Memberships.Lookup(previousID, &owner); err == nil && owner == cgroupID {
+			_ = s.objects.Memberships.Delete(previousID)
+		}
+	}
+	s.members[cgroupID] = append([]uint64(nil), memberIDs...)
+	return nil
+}
+
 func (s *KernelSource) Remove(_ context.Context, cgroupID uint64) error {
+	s.membersMu.Lock()
+	for _, memberID := range s.members[cgroupID] {
+		var owner uint64
+		if err := s.objects.Memberships.Lookup(memberID, &owner); err == nil && owner == cgroupID {
+			_ = s.objects.Memberships.Delete(memberID)
+		}
+	}
+	delete(s.members, cgroupID)
+	s.membersMu.Unlock()
 	if err := s.objects.Entities.Delete(cgroupID); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return fmt.Errorf("remove cgroup accounting: %w", err)
 	}
